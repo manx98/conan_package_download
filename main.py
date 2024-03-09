@@ -1,4 +1,6 @@
+import json
 import shutil
+from functools import total_ordering
 
 import requests
 import yaml
@@ -7,6 +9,7 @@ import os
 from zipfile import ZipFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import hashlib
 
 THREAD_POOL = ThreadPoolExecutor(max_workers=3)
 SOURCES_PREFIX = "_sources/"
@@ -14,7 +17,23 @@ REQUIRES_TREE_FILE = "_requires_tree_file.yml"
 CONAN_DATA_YML = "conandata.yml"
 CONAN_FILE_PY = "conanfile.py"
 CONAN_CONFIG_YML = "config.yml"
+# 缓存文件后缀
 CACHE_TEMPORARY_SUFFIX = ".tmp"
+# 用于优先构建的特殊包名
+FIRST_BUILD_PACKAGE = ["msys2", "ninja", "m4",
+                       "autoconf", "gnu-config", "automake",
+                       "strawberryperl", "meson", "pkgconf", "libtool"]
+
+
+def sha256_file(file_path):
+    hash_object = hashlib.sha256()
+    with open(file_path, "rb") as file:
+        chunk = file.read(4096)
+        while len(chunk) > 0:
+            hash_object.update(chunk)
+            chunk = file.read(4096)
+
+    return hash_object.hexdigest()
 
 
 def clear_cache_tmp(cache_dir):
@@ -49,12 +68,15 @@ def get_dir_by_link(parent_dir, link):
 
 
 def download(file, link):
+    hash_object = hashlib.sha256()
     rsp = requests.get(link, headers=None, stream=True)
     if rsp.status_code == 200:
         # 文件开始下载后，可以按需处理这些数据
         for chunk in rsp.iter_content(chunk_size=64 * 1024):
             if chunk:  # filter out keep-alive new chunks
+                hash_object.update(chunk)
                 file.write(chunk)
+        return hash_object.hexdigest()
     else:
         raise Exception(f"Request failed with status code: {rsp.status_code}")
 
@@ -63,158 +85,866 @@ def conan_exist_package(package, remote):
     return os.popen(f"conan list \"{package}\" -r={remote}").read().find("not found") == -1
 
 
-class VersionSource:
-    def __init__(self, url_data):
-        self.data = url_data
-        self.url = url_data.get("url")
-        if self.url and not isinstance(self.url, (list, tuple)):
-            self.set_url([self.url])
-
-    def set_url(self, url):
-        self.data["url"] = url
-        self.url = url
-
-    def download(self, source_cache_dir):
-        if self.url:
-            for i, url in enumerate(self.url):
-                source_path = get_dir_by_link(source_cache_dir, url)
-                if os.path.exists(source_path):
-                    return [self, url, source_path]
-                source_path_parent = os.path.dirname(source_path)
-                os.makedirs(source_path_parent, exist_ok=True)
-                source_path_tmp = f"{source_path}{CACHE_TEMPORARY_SUFFIX}"
-                try:
-                    with open(source_path_tmp, "wb") as file:
-                        download(file, url)
-                    try:
-                        os.rename(source_path_tmp, source_path)
-                    except FileExistsError:
-                        os.remove(source_path_tmp)
-                    return [self, url, source_path]
-                except Exception as error:
-                    if i != len(self.url) - 1:
-                        print(f"Could not download from the URL {url}: {error}.")
-                        print("Trying another mirror.")
-                    else:
-                        raise
-        return [self, None, None]
-
-    def apply_to_new_server(self, new_server):
-        if self.url:
-            if self.url.startswith("http:/"):
-                self.set_url(new_server + remove_prefix(self.url, "http:/"))
-            elif self.url.startswith("https:/"):
-                self.set_url(new_server + remove_prefix(self.url, "https:/"))
-
-
-class ConanData:
-    def __init__(self, conan_data):
-        self.data = conan_data
-        self.sources = self.load_links()
-
-    def load_links(self):
-        result = []
-        sources = self.data.get("sources")
-        if sources:
-            for version in sources.values():
-                result.append(VersionSource(version))
-        return result
-
-    def dumps(self):
-        return yaml.dump(self.data, default_flow_style=False)
-
-
-class ConanIndex:
-
-    def __init__(self, index_dir, source_cache_dir):
-        self.index_dir = index_dir
-        self.source_cache_dir = source_cache_dir
-
-    def get_versions(self, name):
-        versions = load_yaml(os.path.join(self.index_dir, name, CONAN_CONFIG_YML)).get("versions")
-        if versions:
-            return list(versions.keys())
-        return []
-
-    def export(self, names, save_path):
-        requires_set = set(names)
-        require_tree = {}
-        with ZipFile(save_path, "w") as zip_file:
-            while requires_set:
-                name = requires_set.pop()
-                if name in require_tree:
-                    continue
-                require_tree_node = []
-                require_tree[name] = {
-                    "versions": self.get_versions(name),
-                    "requires": require_tree_node
-                }
-                archive_tool = ConanZipExport(index_dir=self.index_dir, name=name, zip_file=zip_file,
-                                              source_cache_dir=self.source_cache_dir)
-                archive_tool.archive(requires_set=requires_set, require_tree_node=require_tree_node)
-            zip_file.writestr(REQUIRES_TREE_FILE, yaml.dump(require_tree).encode())
+def find_content(start, content, prefix):
+    start = content.find(prefix, start)
+    if start == -1:
+        return None, None
+    start += len(prefix)
+    end = content.find(")", start)
+    if end == -1:
+        return None, None
+    start = content.find("\"", start, end)
+    if start == -1:
+        return None, None
+    start += 1
+    end = content.find("\"", start, end)
+    if end == -1:
+        return None, None
+    return content[start:end], end
 
 
 def collect_requires(collect, conan_file_py_path):
     with open(conan_file_py_path, "r", encoding="utf-8") as f:
         content = f.read()
-        start = 0
-        start_prefix = "self.requires("
-        while True:
-            start = content.find(start_prefix, start)
-            if start != -1:
-                start += len(start_prefix)
-                start = content.find('"', start)
-                if start != -1:
-                    start += 1
-                    end = content.find('"', start)
-                    if end != -1:
-                        name = content[start:end].split("/")
-                        if len(name) == 2:
-                            collect(name[0])
-                        start = end + 1
-                        continue
+    start = 0
+    while True:
+        tool_require, start = find_content(start, content, "self.tool_requires(")
+        if tool_require is None:
             break
+        collect(tool_require)
+    while True:
+        require, start = find_content(start, content, "self.requires(")
+        if require is None:
+            break
+        collect(require)
 
 
-class ConanZipExport:
-    def __init__(self, zip_file: ZipFile, index_dir, name, source_cache_dir):
-        self.source_cache_dir = source_cache_dir
-        self.name = name
-        self.recipe_dir = os.path.join(index_dir, name)
-        self.zip_file = zip_file
+class ZipTool:
+    def __init__(self, path):
+        self.zip_file = ZipFile(path, "w")
 
-    def archive_conan_source(self, path):
-        data = ConanData(load_yaml(path))
-        tasks = []
-        for link in data.load_links():
-            tasks.append(THREAD_POOL.submit(link.download, self.source_cache_dir))
-        with tqdm(total=len(tasks), desc=f"下载{self.name}") as tq:
-            for task in as_completed(tasks):
-                link, url, source_path = task.result()
-                if source_path and url:
-                    self.zip_file.write(source_path, get_dir_by_link(SOURCES_PREFIX, url))
-                tq.set_postfix({"url": url})
-                link.set_url(url)
-                tq.update()
-        return data.dumps()
+    def __enter__(self):
+        return self
 
-    def archive(self, requires_set, require_tree_node):
-        for root, _, files in os.walk(self.recipe_dir):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.zip_file.close()
+
+    def add_file(self, file_path: str, start_path: str, prefix=None, tq=None):
+        if prefix is None:
+            arc_name = os.path.sep + os.path.relpath(file_path, start_path)
+        else:
+            arc_name = prefix + os.path.relpath(file_path, start_path)
+        self.zip_file.write(file_path, arc_name)
+        if tq:
+            tq.set_postfix({"打包文件": arc_name})
+        return arc_name
+
+    def add_dir(self, dir_path: str, start_path: str, tq: None):
+        for root, _, files in os.walk(dir_path):
             for file in files:
-                file_path = os.path.join(root, file)
-                arc_file = self.name + remove_prefix(file_path, self.recipe_dir)
-                if file == CONAN_DATA_YML:
-                    self.zip_file.writestr(arc_file, self.archive_conan_source(file_path))
-                else:
-                    if file == CONAN_FILE_PY:
-                        def collect(name):
-                            if name not in require_tree_node:
-                                require_tree_node.append(name)
-                            requires_set.add(name)
+                file = os.path.join(root, file)
+                self.add_file(file, start_path, tq=tq)
 
-                        collect_requires(collect, file_path)
-                    self.zip_file.write(file_path, arc_file)
+    def writestr(self, name, data):
+        self.zip_file.writestr(name, data)
+
+
+class _VersionItem:
+    """ a single "digit" in a version, like X.Y.Z all X and Y and Z are VersionItems
+    They can be int or strings
+    """
+
+    def __init__(self, item):
+        try:
+            self._v = int(item)
+        except ValueError:
+            self._v = item
+
+    @property
+    def value(self):
+        return self._v
+
+    def __str__(self):
+        return str(self._v)
+
+    def __add__(self, other):
+        # necessary for the "bump()" functionality. Other aritmetic operations are missing
+        return self._v + other
+
+    def __eq__(self, other):
+        if not isinstance(other, _VersionItem):
+            other = _VersionItem(other)
+        return self._v == other._v
+
+    def __hash__(self):
+        return hash(self._v)
+
+    def __lt__(self, other):
+        """
+        @type other: _VersionItem
+        """
+        if not isinstance(other, _VersionItem):
+            other = _VersionItem(other)
+        try:
+            return self._v < other._v
+        except TypeError:
+            return str(self._v) < str(other._v)
+
+
+@total_ordering
+class Version:
+    """
+    This is NOT an implementation of semver, as users may use any pattern in their versions.
+    It is just a helper to parse "." or "-" and compare taking into account integers when possible
+    """
+
+    def __init__(self, value, qualifier=False):
+        value = str(value)
+        self._value = value
+        self._build = None
+        self._pre = None
+        self._qualifier = qualifier  # it is a prerelease or build qualifier, not a main version
+
+        if not qualifier:
+            items = value.rsplit("+", 1)  # split for build
+            if len(items) == 2:
+                value, build = items
+                self._build = Version(build, qualifier=True)  # This is a nested version by itself
+
+            # split for pre-release, from the left, semver allows hyphens in identifiers :(
+            items = value.split("-", 1)
+            if len(items) == 2:
+                value, pre = items
+                self._pre = Version(pre, qualifier=True)  # This is a nested version by itself
+
+        items = value.split(".")
+        items = [_VersionItem(item) for item in items]
+        self._items = tuple(items)
+        while items and items[-1].value == 0:
+            del items[-1]
+        self._nonzero_items = tuple(items)
+
+    def bump(self, index):
+        """
+        :meta private:
+            Bump the version
+            Increments by 1 the version field at the specified index, setting to 0 the fields
+            on the right.
+            2.5 => bump(1) => 2.6
+            1.5.7 => bump(0) => 2.0.0
+
+        :param index:
+        """
+        # this method is used to compute version ranges from tilde ~1.2 and caret ^1.2.1 ranges
+        # TODO: at this moment it only works for digits, cannot increment pre-release or builds
+        # better not make it public yet, keep it internal
+        items = list(self._items[:index])
+        try:
+            items.append(self._items[index] + 1)
+        except TypeError:
+            raise Exception(f"Cannot bump '{self._value} version index {index}, not an int")
+        items.extend([0] * (len(items) - index - 1))
+        v = ".".join(str(i) for i in items)
+        # prerelease and build are dropped while bumping digits
+        return Version(v)
+
+    def upper_bound(self, index):
+        items = list(self._items[:index])
+        try:
+            items.append(self._items[index] + 1)
+        except TypeError:
+            raise Exception(f"Cannot bump '{self._value} version index {index}, not an int")
+        items.extend([0] * (len(items) - index - 1))
+        v = ".".join(str(i) for i in items)
+        v += "-"  # Exclude prereleases
+        return Version(v)
+
+    @property
+    def pre(self):
+        return self._pre
+
+    @property
+    def build(self):
+        return self._build
+
+    @property
+    def main(self):
+        return self._items
+
+    @property
+    def major(self):
+        try:
+            return self.main[0]
+        except IndexError:
+            return None
+
+    @property
+    def minor(self):
+        try:
+            return self.main[1]
+        except IndexError:
+            return None
+
+    @property
+    def patch(self):
+        try:
+            return self.main[2]
+        except IndexError:
+            return None
+
+    @property
+    def micro(self):
+        try:
+            return self.main[3]
+        except IndexError:
+            return None
+
+    def version_range(self):
+        """ returns the version range expression, without brackets []
+        or None if it is not an expression
+        """
+        version = repr(self)
+        if version.startswith("[") and version.endswith("]"):
+            return VersionRange(version[1:-1])
+
+    def __str__(self):
+        return self._value
+
+    def __repr__(self):
+        return self._value
+
+    def __eq__(self, other):
+        if other is None:
+            return False
+        if not isinstance(other, Version):
+            other = Version(other, self._qualifier)
+
+        return (self._nonzero_items, self._pre, self._build) == \
+            (other._nonzero_items, other._pre, other._build)
+
+    def __hash__(self):
+        return hash((self._nonzero_items, self._pre, self._build))
+
+    def __lt__(self, other):
+        if other is None:
+            return False
+        if not isinstance(other, Version):
+            other = Version(other)
+
+        if self._pre:
+            if other._pre:  # both are pre-releases
+                return (self._nonzero_items, self._pre, self._build) < \
+                    (other._nonzero_items, other._pre, other._build)
+            else:  # Left hand is pre-release, right side is regular
+                if self._nonzero_items == other._nonzero_items:  # Problem only happens if both equal
+                    return True
+                else:
+                    return self._nonzero_items < other._nonzero_items
+        else:
+            if other._pre:  # Left hand is regular, right side is pre-release
+                if self._nonzero_items == other._nonzero_items:  # Problem only happens if both equal
+                    return False
+                else:
+                    return self._nonzero_items < other._nonzero_items
+            else:  # None of them is pre-release
+                return (self._nonzero_items, self._build) < (other._nonzero_items, other._build)
+
+
+@total_ordering
+class _Condition:
+    def __init__(self, operator, version):
+        self.operator = operator
+        self.display_version = version
+
+        value = str(version)
+        if (operator == ">=" or operator == "<") and "-" not in value:
+            value += "-"
+        self.version = Version(value)
+
+    def __str__(self):
+        return f"{self.operator}{self.display_version}"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash((self.operator, self.version))
+
+    def __lt__(self, other):
+        # Notice that this is done on the modified version, might contain extra prereleases
+        if self.version < other.version:
+            return True
+        elif self.version == other.version:
+            if self.operator == "<":
+                if other.operator == "<":
+                    return self.display_version.pre is not None
+                else:
+                    return True
+            elif self.operator == "<=":
+                if other.operator == "<":
+                    return False
+                else:
+                    return self.display_version.pre is None
+            elif self.operator == ">":
+                if other.operator == ">":
+                    return self.display_version.pre is None
+                else:
+                    return False
+            else:
+                if other.operator == ">":
+                    return True
+                # There's a possibility of getting here while validating if a range is non-void
+                # by comparing >= & <= for lower limit <= upper limit
+                elif other.operator == "<=":
+                    return True
+                else:
+                    return self.display_version.pre is not None
+        return False
+
+    def __eq__(self, other):
+        return (self.display_version == other.display_version and
+                self.operator == other.operator)
+
+
+class _ConditionSet:
+
+    def __init__(self, expression, prerelease):
+        expressions = expression.split()
+        self.prerelease = prerelease
+        self.conditions = []
+        for e in expressions:
+            e = e.strip()
+            self.conditions.extend(self._parse_expression(e))
+
+    @staticmethod
+    def _parse_expression(expression):
+        if expression in ("", "*"):
+            return [_Condition(">=", Version("0.0.0"))]
+        elif len(expression) == 1:
+            raise Exception(f'Error parsing version range "{expression}"')
+
+        operator = expression[0]
+        if operator not in (">", "<", "^", "~", "="):
+            operator = "="
+            index = 0
+        else:
+            index = 1
+        if operator in (">", "<"):
+            if expression[1] == "=":
+                operator += "="
+                index = 2
+        version = expression[index:]
+        if version == "":
+            raise Exception(f'Error parsing version range "{expression}"')
+        if operator == "~":  # tilde minor
+            if "-" not in version:
+                version += "-"
+            v = Version(version)
+            index = 1 if len(v.main) > 1 else 0
+            return [_Condition(">=", v), _Condition("<", v.upper_bound(index))]
+        elif operator == "^":  # caret major
+            v = Version(version)
+
+            def first_non_zero(main):
+                for i, m in enumerate(main):
+                    if m != 0:
+                        return i
+                return len(main)
+
+            initial_index = first_non_zero(v.main)
+            return [_Condition(">=", v), _Condition("<", v.upper_bound(initial_index))]
+        else:
+            return [_Condition(operator, Version(version))]
+
+    def _valid(self, version, conf_resolve_prepreleases):
+        if version.pre:
+            # Follow the expression desires only if core.version_ranges:resolve_prereleases is None,
+            # else force to the conf's value
+            if conf_resolve_prepreleases is None:
+                if not self.prerelease:
+                    return False
+            elif conf_resolve_prepreleases is False:
+                return False
+        for condition in self.conditions:
+            if condition.operator == ">":
+                if not version > condition.version:
+                    return False
+            elif condition.operator == "<":
+                if not version < condition.version:
+                    return False
+            elif condition.operator == ">=":
+                if not version >= condition.version:
+                    return False
+            elif condition.operator == "<=":
+                if not version <= condition.version:
+                    return False
+            elif condition.operator == "=":
+                if not version == condition.version:
+                    return False
+        return True
+
+
+class VersionRange:
+    def __init__(self, expression):
+        self._expression = expression
+        tokens = expression.split(",")
+        prereleases = False
+        for t in tokens[1:]:
+            if "include_prerelease" in t:
+                if "include_prerelease=" in t:
+                    from conan.api.output import ConanOutput
+                    ConanOutput().warning(
+                        f'include_prerelease version range option in "{expression}" does not take an attribute, '
+                        'its presence unconditionally enables prereleases')
+                prereleases = True
+                break
+            else:
+                t = t.strip()
+                if len(t) > 0 and t[0].isalpha():
+                    from conan.api.output import ConanOutput
+                    ConanOutput().warning(f'Unrecognized version range option "{t}" in "{expression}"')
+                else:
+                    raise Exception(f'"{t}" in version range "{expression}" is not a valid option')
+        version_expr = tokens[0]
+        self.condition_sets = []
+        for alternative in version_expr.split("||"):
+            self.condition_sets.append(_ConditionSet(alternative, prereleases))
+
+    def __str__(self):
+        return self._expression
+
+    def contains(self, version, resolve_prerelease):
+        """
+        Whether <version> is inside the version range
+
+        :param version: Version to check against
+        :param resolve_prerelease: If ``True``, ensure prereleases can be resolved in this range
+        If ``False``, prerelases can NOT be resolved in this range
+        If ``None``, prereleases are resolved only if this version range expression says so
+        :return: Whether the version is inside the range
+        """
+        assert isinstance(version, Version), type(version)
+        for condition_set in self.condition_sets:
+            if condition_set._valid(version, resolve_prerelease):
+                return True
+        return False
+
+    def intersection(self, other):
+        conditions = []
+
+        def _calculate_limits(operator, lhs, rhs):
+            limits = ([c for c in lhs.conditions if operator in c.operator]
+                      + [c for c in rhs.conditions if operator in c.operator])
+            if limits:
+                return sorted(limits, reverse=operator == ">")[0]
+
+        for lhs_conditions in self.condition_sets:
+            for rhs_conditions in other.condition_sets:
+                internal_conditions = []
+                lower_limit = _calculate_limits(">", lhs_conditions, rhs_conditions)
+                upper_limit = _calculate_limits("<", lhs_conditions, rhs_conditions)
+                if lower_limit:
+                    internal_conditions.append(lower_limit)
+                if upper_limit:
+                    internal_conditions.append(upper_limit)
+                if internal_conditions and (not lower_limit or not upper_limit or lower_limit <= upper_limit):
+                    conditions.append(internal_conditions)
+
+        if not conditions:
+            return None
+        expression = ' || '.join(' '.join(str(c) for c in cs) for cs in conditions)
+        result = VersionRange(expression)
+        # TODO: Direct definition of conditions not reparsing
+        # result.condition_sets = self.condition_sets + other.condition_sets
+        return result
+
+    def version(self):
+        return Version(f"[{self._expression}]")
+
+
+def load_require(requires):
+    try:
+        # timestamp
+        tokens = requires.rsplit("%", 1)
+        text = tokens[0]
+        timestamp = float(tokens[1]) if len(tokens) == 2 else None
+
+        # revision
+        tokens = text.split("#", 1)
+        ref = tokens[0]
+        revision = tokens[1] if len(tokens) == 2 else None
+
+        # name, version always here
+        tokens = ref.split("@", 1)
+        name, version = tokens[0].split("/", 1)
+        # user and channel
+        if len(tokens) == 2 and tokens[1]:
+            tokens = tokens[1].split("/", 1)
+            user = tokens[0] if tokens[0] else None
+            channel = tokens[1] if len(tokens) == 2 else None
+        else:
+            user = channel = None
+        return [name, Version(version), user, channel, revision, timestamp]
+    except Exception:
+        raise Exception(
+            f"{requires} is not a valid recipe reference, provide a reference"
+            f" in the form name/version[@user/channel]")
+
+
+class ConanCenterIndex:
+    def __init__(self, recipes_dir):
+        self.recipes_dir = recipes_dir
+
+    def get_recipe(self, name):
+        return ConanRecipe(self, name)
+
+
+def get_version_validator(version):
+    version = Version(version)
+    version_range = version.version_range()
+    if version_range:
+        return lambda v: version_range.contains(v, False)
+    else:
+        return lambda v: version == v
+
+
+def get_versions_validator(version_list: list):
+    version_validators = []
+    for version in version_list:
+        version_validators.append(get_version_validator(version))
+
+    def _validator_func(value):
+        for validator in version_validators:
+            if validator(value):
+                return True
+        return False
+
+    return _validator_func
+
+
+class ConanRecipe:
+    def __init__(self, index: ConanCenterIndex, name: str):
+        self.index = index
+        self.name = name
+        self.recipe_dir = os.path.join(index.recipes_dir, name)
+        self.conf = load_yaml(self.get_conf_path())
+
+    def get_conf_path(self):
+        return os.path.join(self.recipe_dir, CONAN_CONFIG_YML)
+
+    def versions(self, validator):
+        versions = self.conf.get("versions")
+        if versions is None:
+            return None
+        for version in versions:
+            version = Version(version)
+            if validator(version):
+                yield version
+
+    def get_recipe_dir(self, version):
+        if isinstance(version, Version):
+            version = repr(version)
+        return os.path.join(self.recipe_dir, self.conf["versions"][version]["folder"])
+
+    def export_to_zip(self, zt: ZipTool, version_list: list, tq=None):
+        zipped = set()
+        validator = get_versions_validator(version_list)
+        for version in self.versions(validator):
+            recipe_dir = self.get_recipe_dir(version)
+            if recipe_dir in zipped:
+                continue
+            zipped.add(recipe_dir)
+            for file_name in os.listdir(recipe_dir):
+                if file_name == CONAN_DATA_YML:
+                    continue
+                file_path = os.path.join(recipe_dir, file_name)
+                if os.path.isdir(file_path):
+                    zt.add_dir(file_path, self.index.recipes_dir, tq=tq)
+                else:
+                    zt.add_file(file_path, self.index.recipes_dir, tq=tq)
+
+        zt.add_file(self.get_conf_path(), self.index.recipes_dir, tq=tq)
+
+
+class ConanResource:
+    def __init__(self, source):
+        self.source = source
+        self.url = source.get("url")
+        self.sha256 = source.get("sha256")
+        if self.url:
+            if isinstance(self.url, str):
+                self.url = [self.url]
+        else:
+            self.url = []
+
+    def download(self, cache_dir):
+        for i, url in enumerate(self.url):
+            source_path = get_dir_by_link(cache_dir, url)
+            if os.path.exists(source_path):
+                local_sha256 = sha256_file(source_path)
+                if local_sha256 != self.sha256:
+                    raise Exception("failed to check sum source file, except sha256 %s, but got %s: %s" %
+                                    (self.sha256, local_sha256, source_path))
+                return url, source_path
+            source_path_parent = os.path.dirname(source_path)
+            os.makedirs(source_path_parent, exist_ok=True)
+            source_path_tmp = f"{source_path}{CACHE_TEMPORARY_SUFFIX}"
+            try:
+                with open(source_path_tmp, "wb") as file:
+                    local_sha256 = download(file, url)
+                if local_sha256 != self.sha256:
+                    raise Exception("failed to check sum download file, except sha256 %s, but got %s: %s" %
+                                    (self.sha256, local_sha256, url))
+                try:
+                    os.rename(source_path_tmp, source_path)
+                except FileExistsError:
+                    pass
+                return url, source_path
+            except Exception as error:
+                if i != len(self.url) - 1:
+                    print(f"Could not download from the URL {url}: {error}.")
+                    print("Trying another mirror.")
+                else:
+                    raise
+            finally:
+                try:
+                    os.remove(source_path_tmp)
+                except FileNotFoundError:
+                    pass
+        return None, None
+
+    def set_url(self, url):
+        self.source["url"] = url
+        self.url = url
+
+    def get_url(self):
+        if self.url:
+            return self.url[0]
+        else:
+            return None
+
+
+def find_and_add_link_item(result, data):
+    if isinstance(data, dict):
+        for source in data.values():
+            if isinstance(source, dict):
+                keys = source.keys()
+                if len(keys) == 2 and 'url' in keys and 'sha256' in keys:
+                    result.append(ConanResource(source))
+                else:
+                    find_and_add_link_item(result, source)
+
+
+class ConanData:
+    def __init__(self, data):
+        self.data = data
+
+    @staticmethod
+    def get_data_file_path(recipe_dir):
+        return os.path.join(recipe_dir, CONAN_DATA_YML)
+
+    @staticmethod
+    def load(recipe_dir):
+        return ConanData(load_yaml(ConanData.get_data_file_path(recipe_dir)))
+
+    @staticmethod
+    def get_requires(recipe_dir):
+        result = set()
+
+        def _collect(name):
+            result.add(name)
+
+        collect_requires(_collect, os.path.join(recipe_dir, CONAN_FILE_PY))
+        return result
+
+    def remove_source_by_validator(self, version_validator):
+        sources = self.data.get("sources")
+        result = []
+        if sources:
+            for version in sources.keys():
+                if not version_validator(version):
+                    result.append(version)
+            for version in result:
+                del sources[version]
+
+    def get_sources(self):
+        result = []
+        find_and_add_link_item(result, self.data.get("sources"))
+        return result
+
+    def dump(self):
+        return yaml.dump(self.data)
+
+
+class ConanRecipeDownloader:
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+
+    def download_source(self, source: ConanResource):
+        url, source_path = source.download(self.cache_dir)
+        if url:
+            source.set_url(url)
+        return url, source_path
+
+    def download_versions(self, recipe: ConanRecipe, zt: ZipTool, versions: list, tq=None):
+        if tq:
+            tq.set_postfix({"name": recipe.name}, refresh=True)
+        validator = get_versions_validator(versions)
+        versions = []
+        conan_data = {}
+        for version in recipe.versions(validator):
+            versions.append(version)
+            recipe_dir = recipe.get_recipe_dir(version)
+            if conan_data.get(recipe_dir) is not None:
+                continue
+            conan_data[recipe_dir] = ConanData.load(recipe_dir)
+        validator = get_versions_validator(versions)
+        download_tasks = []
+        for data in conan_data.values():
+            data.remove_source_by_validator(validator)
+            for source in data.get_sources():
+                download_tasks.append(THREAD_POOL.submit(self.download_source, source))
+        for task in as_completed(download_tasks):
+            url, source_path = task.result()
+            if tq:
+                tq.set_postfix({"name": recipe.name, "url": url}, refresh=True)
+            zt.add_file(source_path, self.cache_dir, prefix=SOURCES_PREFIX, tq=tq)
+            if tq:
+                tq.update(1)
+        for recipe_dir in conan_data:
+            data = conan_data.get(recipe_dir)
+            zt.writestr(os.path.relpath(os.path.join(recipe_dir, CONAN_DATA_YML), recipe.index.recipes_dir),
+                        data.dump())
+        return versions
+
+
+class RequireTree:
+    def __init__(self, tree=None):
+        if tree:
+            self.tree = tree
+        else:
+            self.tree = {}
+
+    @staticmethod
+    def load(recipes_dir):
+        return RequireTree(load_yaml(os.path.join(recipes_dir, REQUIRES_TREE_FILE)))
+
+    def get_node(self, name):
+        return RequireTreeNode(self, name)
+
+    def remove_node(self, name):
+        del self.tree[name]
+        for node in self.nodes():
+            node.remove_require(name)
+
+    def nodes(self):
+        for name in self.tree:
+            yield RequireTreeNode(self, name)
+
+    def dumps(self):
+        return yaml.dump(self.tree)
+
+
+class RequireTreeNode:
+    def __init__(self, root: RequireTree, name):
+        self.name = name
+        data = root.tree.get(name)
+        if not data:
+            self.requires = []
+            self.versions = []
+            root.tree[name] = {
+                'requires': self.requires,
+                'versions': self.versions,
+            }
+        else:
+            self.requires = data['requires']
+            self.versions = data['versions']
+
+    def add_version(self, version):
+        if version not in self.versions:
+            self.versions.append(repr(version))
+            print(f"需要下载包: {self.name}/{version}")
+
+    def check_and_remove_exist_version(self, remote):
+        for version in self.versions:
+            if conan_exist_package(f"{self.name}/{version}", remote):
+                self.remove_version(version)
+
+    def remove_version(self, version):
+        if version in self.versions:
+            self.versions.remove(version)
+
+    def remove_require(self, require):
+        if require in self.requires:
+            self.requires.remove(require)
+
+    def add_require(self, require):
+        if require not in self.requires:
+            self.requires.append(require)
+            print(f"包 {self.name} 依赖 {require}")
+
+    def build_and_upload(self, remote, recipe: ConanRecipe, tq):
+        tq.set_description(f"正在构建 {self.name}")
+        for version in self.versions:
+            package_name = f"{self.name}/{version}"
+            tq.set_postfix({"building": version})
+            work_dir = recipe.get_recipe_dir(version)
+            code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} --build=missing")
+            if code != 0:
+                raise Exception(f"构建 {package_name} 失败了, 错误退出码 {code}: {work_dir}")
+            else:
+                tq.set_postfix({"uploading": version}, refresh=True)
+                code = os.system(f"conan upload {package_name} -r={remote}")
+            if code != 0:
+                raise Exception(
+                    f"执行上传构建 {package_name} 到远程仓库 {remote} 失败, 错误退出码 {code}: {work_dir} ")
+            tq.update()
+
+
+class ConanRecipeWithRequiresDownloader:
+    def __init__(self, recipes_dir, cache_dir, output_path):
+        self.index = ConanCenterIndex(recipes_dir)
+        self.downloader = ConanRecipeDownloader(cache_dir)
+        self.zip_tool = ZipTool(output_path)
+        self.requires_tree = RequireTree()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.zip_tool.__exit__(exc_type, exc_val, exc_tb)
+
+    def collect_all_requires(self, requires, parent=None, visited=None):
+        if visited is None:
+            visited = set()
+        if parent:
+            parent = self.requires_tree.get_node(parent)
+        for require in requires:
+            name, version, _, _, _, _ = load_require(require)
+            if parent:
+                parent.add_require(name)
+            child = self.requires_tree.get_node(name)
+            recipe = self.index.get_recipe(name)
+            for version in recipe.versions(get_version_validator(version)):
+                child.add_version(version)
+                recipe_dir = recipe.get_recipe_dir(version)
+                if recipe_dir in visited:
+                    continue
+                visited.add(recipe_dir)
+                self.collect_all_requires(parent=name, requires=ConanData.get_requires(recipe_dir), visited=visited)
+
+    def download(self, requires: list):
+        print("开始加载依赖关系...")
+        self.collect_all_requires(requires)
+        self.zip_tool.writestr(REQUIRES_TREE_FILE, self.requires_tree.dumps())
+        total = 0
+        for node in self.requires_tree.nodes():
+            total += len(node.versions)
+        with tqdm(total=total, desc="下载并打包资源") as tq:
+            for node in self.requires_tree.nodes():
+                recipe = self.index.get_recipe(node.name)
+                self.downloader.download_versions(recipe, self.zip_tool, node.versions, tq=tq)
+                recipe.export_to_zip(self.zip_tool, node.versions, tq=tq)
 
 
 def extract_file(zip_file, filename, output_dir):
@@ -234,23 +964,30 @@ def extract_file(zip_file, filename, output_dir):
 class ArtifactoryTool:
     def __init__(self, zip_file_path, server_url):
         self.zip_file_path = zip_file_path
-        self.server_url = server_url
+        if not server_url.endswith("/"):
+            self.server_url = server_url + "/"
+        else:
+            self.server_url = server_url
 
-    def upload(self, zip_file, file):
+    def upload(self, zip_file, file, force_upload=False):
         upload_url = self.server_url + remove_prefix(file, SOURCES_PREFIX)
+        if not force_upload:
+            with requests.get(url=upload_url, stream=True) as rsp:
+                if rsp.status_code == 200:
+                    return file
         with zip_file.open(file, 'r') as f:
             rsp = requests.put(upload_url, data=f)
             if 300 <= rsp.status_code or rsp.status_code < 200:
                 raise Exception(f"Invalid response status code {rsp.status_code}: {rsp.text}")
             return file
 
-    def upload_source_to_server(self):
+    def upload_source_to_server(self, force_upload=False):
         with ZipFile(self.zip_file_path) as zip_file:
             tasks = []
             for file in zip_file.filelist:
                 if file.filename.startswith(SOURCES_PREFIX):
-                    tasks.append(THREAD_POOL.submit(self.upload, zip_file, file.filename))
-            with tqdm(total=len(tasks), desc="上传") as tq:
+                    tasks.append(THREAD_POOL.submit(self.upload, zip_file, file.filename, force_upload))
+            with tqdm(total=len(tasks), desc="上传source") as tq:
                 for task in as_completed(tasks):
                     file = task.result()
                     tq.set_postfix({
@@ -264,17 +1001,17 @@ class ArtifactoryTool:
                 if name.endswith(CONAN_DATA_YML):
                     with zip_file.open(name) as data_file:
                         conan_data = ConanData(yaml.safe_load(data_file))
-                        for link in conan_data.load_links():
-                            if link.url:
-                                url = link.url[0]
-                                if url.startswith("http:/"):
-                                    link.set_url(self.server_url + url.removeprefix("http:/"))
-                                elif url.startswith("https:/"):
-                                    link.set_url(self.server_url + url.removeprefix("https:/"))
+                        for source in conan_data.get_sources():
+                            url = source.get_url()
+                            if url:
+                                if url.startswith("http://"):
+                                    source.set_url(self.server_url + remove_prefix(url, "http://"))
+                                elif url.startswith("https://"):
+                                    source.set_url(self.server_url + remove_prefix(url, "https://"))
                         save_path = os.path.join(output_dir, name)
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
                         with open(save_path, "w", encoding="utf8") as f:
-                            f.write(conan_data.dumps())
+                            f.write(conan_data.dump())
                         return name
                 else:
                     return extract_file(zip_file, name, output_dir)
@@ -292,129 +1029,90 @@ class ArtifactoryTool:
                     tq.update()
 
 
-class RequireTree:
-    def __init__(self, recipes_dir):
-        self.recipes_dir = recipes_dir
-        self.require_data = load_yaml(os.path.join(recipes_dir, REQUIRES_TREE_FILE))
-
-    def get_nodes(self):
-        nodes = []
-        for recipe in self.require_data.keys():
-            nodes.append(self.get_node(recipe))
-        return nodes
-
-    def get_node(self, recipe):
-        node = RequireTreeNode(recipe, self)
-        if node.data:
-            return node
-        return None
-
-
-class RequireTreeNode:
-    def __init__(self, recipe, tree):
-        self.tree = tree
-        self.recipe = recipe
-        self.data = tree.require_data.get(recipe)
-        self.recipe_dir = os.path.join(tree.recipes_dir, recipe)
-        self.conf = load_yaml(os.path.join(self.recipe_dir, CONAN_CONFIG_YML))
-        self.versions = self.data.get("versions")
-        if not self.versions:
-            self.versions = []
-        self.requires = self.data.get("requires")
-        if not self.requires:
-            self.requires = []
-
-    def exist(self, remote):
-        return conan_exist_package(self.recipe, remote)
-
-    def can_build(self, remote):
-        for require in self.requires:
-            if conan_exist_package(require, remote):
-                continue
-            return False
-        return True
-
-    def remove(self):
-        self.tree.require_data.pop(self.recipe)
-
-    def get_work_dir(self, version):
-        return os.path.join(self.recipe_dir, self.conf["versions"][version]["folder"])
-
-    def build_and_upload(self, remote):
-        with tqdm(total=len(self.versions), desc=f"正在构建 {self.recipe}") as tq:
-            for version in self.versions:
-                tq.set_postfix({"building": version}, refresh=True)
-                code = os.system(
-                    f"conan create \"{self.get_work_dir(version)}\" --version={version} --name={self.recipe}")
-                if code != 0:
-                    raise Exception(f"构建 {self.recipe}/{version} 失败了, 错误退出码:{code}")
-                else:
-                    tq.set_postfix({"uploading": version}, refresh=True)
-                    code = os.system(f"conan upload {self.recipe}/{version} -r={remote}")
-                if code != 0:
-                    raise Exception(f"执行上传构建 {self.recipe}/{version} 到远程仓库 {remote} 失败, 错误退出码:{code} ")
-                tq.update()
-
-
 class ConanBuildTool:
     def __init__(self, remote, recipes_dir):
         self.remote = remote
-        self.recipes_dir = recipes_dir
-        self.tree = RequireTree(self.recipes_dir)
+        self.index = ConanCenterIndex(recipes_dir)
+        self.tree = RequireTree.load(recipes_dir)
+
+    def _check_and_remove_exist(self, node, version):
+        return node, version, conan_exist_package(f"{node.name}/{version}", self.remote)
+
+    def check_and_clear_exist(self):
+        tasks = []
+        for node in self.tree.nodes():
+            for version in node.versions:
+                tasks.append(THREAD_POOL.submit(self._check_and_remove_exist, node, version))
+        with tqdm(total=len(tasks), desc="检查已存在包") as tq:
+            for task in tasks:
+                node, version, exist = task.result()
+                if exist:
+                    node.remove_version(version)
+                tq.set_postfix({"name": node.name, "version": version}, refresh=False)
+                tq.update()
+        total = 0
+        for node in self.tree.nodes():
+            total += len(node.versions)
+        return total
 
     def get_can_build_node(self):
-        nodes = self.tree.get_nodes()
-        while nodes:
-            node = nodes.pop()
-            if node.exist(self.remote):
-                print(f"[跳过]远程仓库{self.remote}已存在包: {node.recipe}")
-                node.remove()
-                continue
-            if node.can_build(self.remote):
+        for name in FIRST_BUILD_PACKAGE:
+            node = self.tree.get_node(name)
+            if node:
+                if node.requires:
+                    continue
                 return node
-        nodes = self.tree.get_nodes()
+        nodes = []
+        for node in self.tree.nodes():
+            if node.requires:
+                nodes.append(node)
+                continue
+            return node
         if nodes:
-            raise Exception("can't resolve requires:" + ",".join([node.recipe for node in nodes]))
+            raise Exception("can't resolve requires:" + ",".join([node.name for node in nodes]))
         return None
 
     def create_and_upload(self):
-        while True:
-            node = self.get_can_build_node()
-            if not node:
-                break
-            node.build_and_upload(self.remote)
-            node.remove()
+        total = self.check_and_clear_exist()
+        with tqdm(total=total, desc="构建依赖") as tq:
+            while True:
+                node = self.get_can_build_node()
+                if not node:
+                    break
+                node.build_and_upload(self.remote, ConanRecipe(self.index, node.name), tq)
+                self.tree.remove_node(node.name)
 
 
 # conan-center-index-master\recipes目录
-conan_index_recipes_dir = r"E:\code\conan-center-index-master\recipes"
+CONAN_RECIPES_DIR = r"E:\code\conan-center-index-master\recipes"
 # source文件下载缓存目录
-conan_source_cache_dir = r"E:\code\conan-center-index-master\source_cache"
+CONAN_CACHE_DIR = r"E:\code\conan-center-index-master\source_cache"
+# conan远程仓库
+CONAN_LOCAL_REPOSITORY = "conan-hosted"
 # 上传到的服务器地址
-artifactory_server_url = "http://admin:password@192.168.121.140:8081/artifactory/code_source/"
-# 本地远程仓库
-conan_remote = "conan-hosted"
+ARTIFACTORY_SERVER_URL = "http://admin:password@192.168.121.140:8081/artifactory/code_source/"
 
 
-def archive_conan_artifactory(names, save_path):
+def archive_all_to_file(output_path, requires):
     """
-    下载并导出conan资源文件
-    :param names: 需要导出的包名
-    :param save_path: 导出保存到的文件位置
+    压缩打包依赖包
+    :param output_path: 输出路径
+    :param requires: 依赖包列表
     :return:
     """
-    tool = ConanIndex(index_dir=conan_index_recipes_dir, source_cache_dir=conan_source_cache_dir)
-    tool.export(names=names, save_path=save_path)
+    with ConanRecipeWithRequiresDownloader(CONAN_RECIPES_DIR, CONAN_CACHE_DIR, output_path) as downloader:
+        downloader.download(requires)
 
 
-def upload_to_artifactory_server(archive_file_path):
+def upload_to_artifactory_server(archive_file_path, force_upload=False):
     """
     上传sources到Artifactory服务器
+    :param force_upload: 强制覆盖上传
     :param archive_file_path: conan资源导出包
     :return:
     """
-    tool = ArtifactoryTool(archive_file_path, artifactory_server_url)
-    tool.upload_source_to_server()
+    tool = ArtifactoryTool(archive_file_path, ARTIFACTORY_SERVER_URL)
+    tool.upload_source_to_server(force_upload)
 
 
 def extract_recipes(archive_file_path, output_dir):
@@ -424,7 +1122,9 @@ def extract_recipes(archive_file_path, output_dir):
     :param output_dir: 解压到的路径
     :return:
     """
-    tool = ArtifactoryTool(archive_file_path, artifactory_server_url)
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    tool = ArtifactoryTool(archive_file_path, ARTIFACTORY_SERVER_URL)
     tool.extract_recipes(output_dir)
 
 
@@ -434,11 +1134,11 @@ def build_recipes(recipes_dir):
     :param recipes_dir:解压后的打包文件路径
     :return:
     """
-    tool = ConanBuildTool(conan_remote, recipes_dir)
+    tool = ConanBuildTool(CONAN_LOCAL_REPOSITORY, recipes_dir)
     tool.create_and_upload()
 
 
-archive_conan_artifactory(["zlib"], "./data.zip")
+archive_all_to_file("./data.zip", ["libcurl/[*]"])
 upload_to_artifactory_server("./data.zip")
-extract_recipes("./data.zip", "./data")
-build_recipes("./data")
+extract_recipes("./data.zip", "./conan_recipes")
+build_recipes("./conan_recipes")
