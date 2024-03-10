@@ -1,4 +1,4 @@
-import json
+import argparse
 import shutil
 from functools import total_ordering
 
@@ -12,6 +12,10 @@ from tqdm import tqdm
 import hashlib
 
 THREAD_POOL = ThreadPoolExecutor(max_workers=3)
+CONAN_CENTER_INDEX_MASTER_URL = "https://github.com/conan-io/conan-center-index/archive/refs/heads/master.zip"
+CONAN_CENTER_INDEX_RECIPES_DIR = "conan-center-index-master/recipes/"
+CONAN_CENTER_RECIPES_DIR = "recipes"
+CONAN_CENTER_SOURCE_CACHE_DIR = "sources"
 SOURCES_PREFIX = "_sources/"
 REQUIRES_TREE_FILE = "_requires_tree_file.yml"
 CONAN_DATA_YML = "conandata.yml"
@@ -829,6 +833,9 @@ class RequireTree:
     def load(recipes_dir):
         return RequireTree(load_yaml(os.path.join(recipes_dir, REQUIRES_TREE_FILE)))
 
+    def exist_node(self, name):
+        return self.tree.get(name) is not None
+
     def get_node(self, name):
         return RequireTreeNode(self, name)
 
@@ -902,9 +909,9 @@ class RequireTreeNode:
 
 
 class ConanRecipeWithRequiresDownloader:
-    def __init__(self, recipes_dir, cache_dir, output_path):
+    def __init__(self, recipes_dir, source_cache_dir, output_path):
         self.index = ConanCenterIndex(recipes_dir)
-        self.downloader = ConanRecipeDownloader(cache_dir)
+        self.downloader = ConanRecipeDownloader(source_cache_dir)
         self.zip_tool = ZipTool(output_path)
         self.requires_tree = RequireTree()
 
@@ -947,8 +954,10 @@ class ConanRecipeWithRequiresDownloader:
                 recipe.export_to_zip(self.zip_tool, node.versions, tq=tq)
 
 
-def extract_file(zip_file, filename, output_dir):
-    output_path = os.path.join(output_dir, filename)
+def extract_file(zip_file, filename, output_dir, out_filename=None):
+    if not out_filename:
+        out_filename = filename
+    output_path = os.path.join(output_dir, out_filename)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     output_path_tmp = output_path + CACHE_TEMPORARY_SUFFIX
     with open(output_path_tmp, "wb") as f:
@@ -1018,7 +1027,7 @@ class ArtifactoryTool:
 
             tasks = []
             for file in zip_file.filelist:
-                if not file.filename.startswith(SOURCES_PREFIX):
+                if not file.filename.startswith(SOURCES_PREFIX) and not file.is_dir():
                     tasks.append(THREAD_POOL.submit(_extract_file, file.filename))
             with tqdm(total=len(tasks), desc="解包文件") as tq:
                 for task in as_completed(tasks):
@@ -1038,18 +1047,19 @@ class ConanBuildTool:
     def _check_and_remove_exist(self, node, version):
         return node, version, conan_exist_package(f"{node.name}/{version}", self.remote)
 
-    def check_and_clear_exist(self):
-        tasks = []
-        for node in self.tree.nodes():
-            for version in node.versions:
-                tasks.append(THREAD_POOL.submit(self._check_and_remove_exist, node, version))
-        with tqdm(total=len(tasks), desc="检查已存在包") as tq:
-            for task in tasks:
-                node, version, exist = task.result()
-                if exist:
-                    node.remove_version(version)
-                tq.set_postfix({"name": node.name, "version": version}, refresh=False)
-                tq.update()
+    def check_and_clear_exist(self, force=False):
+        if not force:
+            tasks = []
+            for node in self.tree.nodes():
+                for version in node.versions:
+                    tasks.append(THREAD_POOL.submit(self._check_and_remove_exist, node, version))
+            with tqdm(total=len(tasks), desc="检查已存在包") as tq:
+                for task in tasks:
+                    node, version, exist = task.result()
+                    if exist:
+                        node.remove_version(version)
+                    tq.set_postfix({"name": node.name, "version": version}, refresh=False)
+                    tq.update()
         total = 0
         for node in self.tree.nodes():
             total += len(node.versions)
@@ -1057,8 +1067,8 @@ class ConanBuildTool:
 
     def get_can_build_node(self):
         for name in FIRST_BUILD_PACKAGE:
-            node = self.tree.get_node(name)
-            if node:
+            if self.tree.exist_node(name):
+                node = self.tree.get_node(name)
                 if node.requires:
                     continue
                 return node
@@ -1072,8 +1082,8 @@ class ConanBuildTool:
             raise Exception("can't resolve requires:" + ",".join([node.name for node in nodes]))
         return None
 
-    def create_and_upload(self):
-        total = self.check_and_clear_exist()
+    def create_and_upload(self, force=False):
+        total = self.check_and_clear_exist(force)
         with tqdm(total=total, desc="构建依赖") as tq:
             while True:
                 node = self.get_can_build_node()
@@ -1083,62 +1093,133 @@ class ConanBuildTool:
                 self.tree.remove_node(node.name)
 
 
-# conan-center-index-master\recipes目录
-CONAN_RECIPES_DIR = r"E:\code\conan-center-index-master\recipes"
-# source文件下载缓存目录
-CONAN_CACHE_DIR = r"E:\code\conan-center-index-master\source_cache"
-# conan远程仓库
-CONAN_LOCAL_REPOSITORY = "conan-hosted"
-# 上传到的服务器地址
-ARTIFACTORY_SERVER_URL = "http://admin:password@192.168.121.140:8081/artifactory/code_source/"
+def get_conan_recipes_dir(force=False):
+    conan_recipes_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_RECIPES_DIR)
+    download_conan_index(conan_recipes_dir, force=force)
+    return conan_recipes_dir
 
 
-def archive_all_to_file(output_path, requires):
+def get_conan_cache_dir():
+    conan_cache_dir = os.getenv("CONAN_CACHE_DIR")
+    if not conan_cache_dir:
+        raise Exception("环境变量 CONAN_CACHE_DIR 请设置到source文件下载缓存目录路径")
+    return conan_cache_dir
+
+
+def get_conan_local_repository():
+    conan_local_repository = os.getenv("CONAN_LOCAL_REPOSITORY")
+    if not conan_local_repository:
+        raise Exception("环境变量 CONAN_LOCAL_REPOSITORY 请设置到conan本地仓库名称")
+    return conan_local_repository
+
+
+def get_artifactory_upload_server_url():
+    artifactory_upload_server_url = os.getenv("ARTIFACTORY_UPLOAD_SERVER_URL")
+    if not artifactory_upload_server_url:
+        raise Exception("环境变量 ARTIFACTORY_UPLOAD_SERVER_URL 请设置到上传服务器地址")
+    return artifactory_upload_server_url
+
+
+def get_artifactory_download_server_url():
+    # 下载服务器地址
+    artifactory_download_server_url = os.getenv("ARTIFACTORY_DOWNLOAD_SERVER_URL")
+    if not artifactory_download_server_url:
+        raise Exception("请设置环境变量 ARTIFACTORY_DOWNLOAD_SERVER_URL 请设置到下载服务器地址")
+    return artifactory_download_server_url
+
+
+def download_conan_index(recipes_dir, force=False):
+    if os.path.exists(recipes_dir):
+        if force:
+            print("正在删除索引目录...")
+            shutil.rmtree(recipes_dir)
+        else:
+            return
+    recipes_dir_tmp = recipes_dir + "_tmp"
+    if os.path.exists(recipes_dir_tmp):
+        print("正在删除临时目录...")
+        shutil.rmtree(recipes_dir_tmp)
+    os.makedirs(recipes_dir_tmp, exist_ok=True)
+    tmp_file = os.path.join(recipes_dir_tmp, "master.zip")
+    try:
+        print("开始下载索引文件...")
+        with open(tmp_file, "wb") as f:
+            download(f, CONAN_CENTER_INDEX_MASTER_URL)
+        with ZipFile(tmp_file) as zip_file:
+            with tqdm(total=len(zip_file.filelist), desc="正在解压索引") as tq:
+                for file in zip_file.filelist:
+                    if file.filename.startswith(CONAN_CENTER_INDEX_RECIPES_DIR) and not file.is_dir():
+                        extract_file(zip_file, file.filename, recipes_dir_tmp,
+                                     remove_prefix(file.filename, CONAN_CENTER_INDEX_RECIPES_DIR))
+                    tq.update()
+    finally:
+        try:
+            os.remove(tmp_file)
+        except FileNotFoundError:
+            pass
+    os.rename(recipes_dir_tmp, recipes_dir)
+
+
+def archive_all_to_file(params):
     """
-    压缩打包依赖包
-    :param output_path: 输出路径
-    :param requires: 依赖包列表
+    下载并导出conan资源到文件
+    :param params:
     :return:
     """
-    with ConanRecipeWithRequiresDownloader(CONAN_RECIPES_DIR, CONAN_CACHE_DIR, output_path) as downloader:
-        downloader.download(requires)
+    sources_cache_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_SOURCE_CACHE_DIR)
+    with ConanRecipeWithRequiresDownloader(get_conan_recipes_dir(params.f), sources_cache_dir,
+                                           params.dest) as downloader:
+        downloader.download(params.requires)
 
 
-def upload_to_artifactory_server(archive_file_path, force_upload=False):
+def upload_to_artifactory_server(params):
     """
-    上传sources到Artifactory服务器
-    :param force_upload: 强制覆盖上传
-    :param archive_file_path: conan资源导出包
-    :return:
+    上传conan资源到服务器
+     :param params:
+     :return:
     """
-    tool = ArtifactoryTool(archive_file_path, ARTIFACTORY_SERVER_URL)
-    tool.upload_source_to_server(force_upload)
+    tool = ArtifactoryTool(params.src, get_artifactory_upload_server_url())
+    tool.upload_source_to_server(params.f)
 
 
-def extract_recipes(archive_file_path, output_dir):
+def extract_recipes(params):
     """
     解压conan资源导出包
-    :param archive_file_path: conan资源导出包
-    :param output_dir: 解压到的路径
-    :return:
     """
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-    tool = ArtifactoryTool(archive_file_path, ARTIFACTORY_SERVER_URL)
-    tool.extract_recipes(output_dir)
+    if os.path.exists(params.dest):
+        shutil.rmtree(params.dest)
+    tool = ArtifactoryTool(params.src, get_artifactory_download_server_url())
+    tool.extract_recipes(params.dest)
 
 
-def build_recipes(recipes_dir):
+def build_and_upload_recipes(params):
     """
     执行构建并上传到指定远程仓库
-    :param recipes_dir:解压后的打包文件路径
-    :return:
     """
-    tool = ConanBuildTool(CONAN_LOCAL_REPOSITORY, recipes_dir)
-    tool.create_and_upload()
+    tool = ConanBuildTool(get_conan_local_repository(), params.recipes_dir)
+    tool.create_and_upload(params.f)
 
 
-archive_all_to_file("./data.zip", ["libcurl/[*]"])
-upload_to_artifactory_server("./data.zip")
-extract_recipes("./data.zip", "./conan_recipes")
-build_recipes("./conan_recipes")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Conan中央仓库离线工具')
+    parser.set_defaults(func=lambda x: parser.print_help())
+    subparsers = parser.add_subparsers(help="子命令")
+    archive = subparsers.add_parser("archive", description="打包conan资源文件")
+    archive.add_argument("dest", help="保存到的路径")
+    archive.add_argument("requires", nargs='+', help="保存到的路径")
+    archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
+    archive.set_defaults(func=archive_all_to_file)
+    upload = subparsers.add_parser("upload")
+    upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
+    upload.add_argument("--f", type=bool, default=False, help="直接覆盖已存在的资源文件")
+    upload.set_defaults(func=upload_to_artifactory_server)
+    extract = subparsers.add_parser("extract", description="解压conan打包文件")
+    extract.add_argument("src", help="打包的资源文件")
+    extract.add_argument("dest", help="解压到的路径")
+    extract.set_defaults(func=extract_recipes)
+    build = subparsers.add_parser("build", description="执行conan构建并上传")
+    build.add_argument("recipes_dir", help="解压后的打包文件路径")
+    build.add_argument("--f", type=bool, default=False, help="强制重新构建")
+    build.set_defaults(func=build_and_upload_recipes)
+    args = parser.parse_args()
+    args.func(args)
