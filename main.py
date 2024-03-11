@@ -1220,7 +1220,7 @@ if __name__ == '__main__':
     subparsers = parser.add_subparsers(help="子命令")
     archive = subparsers.add_parser("archive", description="打包conan资源文件")
     archive.add_argument("dest", help="保存到的路径")
-    archive.add_argument("requires", nargs='+', help="保存到的路径")
+    archive.add_argument("requires", nargs='+', help="需要导出的依赖包")
     archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
     archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
     archive.set_defaults(func=archive_all_to_file)
