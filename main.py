@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import hashlib
 
+VERSION = "v0.0.1"
 THREAD_POOL = ThreadPoolExecutor(max_workers=3)
 CONAN_CENTER_INDEX_MASTER_URL = "https://github.com/conan-io/conan-center-index/archive/refs/heads/master.zip"
 CONAN_CENTER_INDEX_RECIPES_DIR = "conan-center-index-master/recipes/"
@@ -1237,5 +1238,7 @@ if __name__ == '__main__':
     build.add_argument("--f", type=bool, default=False, help="强制重新构建")
     build.add_argument("--export_only", type=bool, default=False, help="仅导出上传")
     build.set_defaults(func=build_and_upload_recipes)
+    version = subparsers.add_parser("version", description="查看当前版本")
+    version.set_defaults(func=lambda params: print(VERSION))
     args = parser.parse_args()
     args.func(args)
