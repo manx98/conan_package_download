@@ -857,13 +857,16 @@ class RequireTreeNode:
         self.name = name
         data = root.tree.get(name)
         if not data:
+            self.ignore = False
             self.requires = []
             self.versions = []
             root.tree[name] = {
+                "ignore": self.ignore,
                 'requires': self.requires,
                 'versions': self.versions,
             }
         else:
+            self.ignore = data['ignore']
             self.requires = data['requires']
             self.versions = data['versions']
 
@@ -1048,6 +1051,12 @@ class ConanBuildTool:
         return node, version, conan_exist_package(f"{node.name}/{version}", self.remote)
 
     def check_and_clear_exist(self, force=False):
+        ignored = set()
+        for node in self.tree.nodes():
+            if node.ignore:
+                ignored.add(node.name)
+        for name in ignored:
+            self.tree.remove_node(name)
         if not force:
             tasks = []
             for node in self.tree.nodes():
@@ -1058,6 +1067,8 @@ class ConanBuildTool:
                     node, version, exist = task.result()
                     if exist:
                         node.remove_version(version)
+                    if not node.versions:
+                        self.tree.remove_node(node.name)
                     tq.set_postfix({"name": node.name, "version": version}, refresh=False)
                     tq.update()
         total = 0
