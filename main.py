@@ -893,13 +893,16 @@ class RequireTreeNode:
             self.requires.append(require)
             print(f"包 {self.name} 依赖 {require}")
 
-    def build_and_upload(self, remote, recipe, tq):
+    def build_and_upload(self, remote, recipe, tq, export_only=False):
         tq.set_description(f"正在构建 {self.name}")
         for version in self.versions:
             package_name = f"{self.name}/{version}"
             tq.set_postfix({"building": version})
             work_dir = recipe.get_recipe_dir(version)
-            code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} --build=missing")
+            if export_only:
+                code = os.system(f"conan export \"{work_dir}\" --version={version} --name={self.name}")
+            else:
+                code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} --build=missing")
             if code != 0:
                 raise Exception(f"构建 {package_name} 失败了, 错误退出码 {code}: {work_dir}")
             else:
@@ -1093,14 +1096,14 @@ class ConanBuildTool:
             raise Exception("can't resolve requires:" + ",".join([node.name for node in nodes]))
         return None
 
-    def create_and_upload(self, force=False):
+    def create_and_upload(self, force=False, export_only=False):
         total = self.check_and_clear_exist(force)
         with tqdm(total=total, desc="构建依赖") as tq:
             while True:
                 node = self.get_can_build_node()
                 if not node:
                     break
-                node.build_and_upload(self.remote, ConanRecipe(self.index, node.name), tq)
+                node.build_and_upload(self.remote, ConanRecipe(self.index, node.name), tq, export_only=export_only)
                 self.tree.remove_node(node.name)
 
 
@@ -1208,7 +1211,7 @@ def build_and_upload_recipes(params):
     执行构建并上传到指定远程仓库
     """
     tool = ConanBuildTool(get_conan_local_repository(), params.recipes_dir)
-    tool.create_and_upload(params.f)
+    tool.create_and_upload(params.f, export_only=params.export_only)
 
 
 if __name__ == '__main__':
@@ -1231,6 +1234,7 @@ if __name__ == '__main__':
     build = subparsers.add_parser("build", description="执行conan构建并上传")
     build.add_argument("recipes_dir", help="解压后的打包文件路径")
     build.add_argument("--f", type=bool, default=False, help="强制重新构建")
+    build.add_argument("--export_only", type=bool, default=False, help="仅导出上传")
     build.set_defaults(func=build_and_upload_recipes)
     args = parser.parse_args()
     args.func(args)
