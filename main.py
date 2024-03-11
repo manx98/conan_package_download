@@ -6,7 +6,7 @@ import requests
 import yaml
 from urllib.parse import urlparse
 import os
-from zipfile import ZipFile
+from zipfile import ZipFile, ZIP_DEFLATED
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import hashlib
@@ -124,8 +124,8 @@ def collect_requires(collect, conan_file_py_path):
 
 
 class ZipTool:
-    def __init__(self, path):
-        self.zip_file = ZipFile(path, "w")
+    def __init__(self, path, compress_level=0):
+        self.zip_file = ZipFile(path, "w", ZIP_DEFLATED, compresslevel=compress_level)
 
     def __enter__(self):
         return self
@@ -915,10 +915,10 @@ class RequireTreeNode:
 
 
 class ConanRecipeWithRequiresDownloader:
-    def __init__(self, recipes_dir, source_cache_dir, output_path):
+    def __init__(self, recipes_dir, source_cache_dir, output_path, compress_level=0):
         self.index = ConanCenterIndex(recipes_dir)
         self.downloader = ConanRecipeDownloader(source_cache_dir)
-        self.zip_tool = ZipTool(output_path)
+        self.zip_tool = ZipTool(output_path, compress_level=compress_level)
         self.requires_tree = RequireTree()
 
     def __enter__(self):
@@ -1182,7 +1182,7 @@ def archive_all_to_file(params):
     """
     sources_cache_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_SOURCE_CACHE_DIR)
     with ConanRecipeWithRequiresDownloader(get_conan_recipes_dir(params.f), sources_cache_dir,
-                                           params.dest) as downloader:
+                                           params.dest, compress_level=params.compress_level) as downloader:
         downloader.download(params.requires)
 
 
@@ -1222,6 +1222,7 @@ if __name__ == '__main__':
     archive.add_argument("dest", help="保存到的路径")
     archive.add_argument("requires", nargs='+', help="保存到的路径")
     archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
+    archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
     archive.set_defaults(func=archive_all_to_file)
     upload = subparsers.add_parser("upload")
     upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
