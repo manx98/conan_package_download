@@ -612,7 +612,7 @@ def get_version_validator(version):
         return lambda v: version == v
 
 
-def get_versions_validator(version_list: list):
+def get_versions_validator(version_list):
     version_validators = []
     for version in version_list:
         version_validators.append(get_version_validator(version))
@@ -627,7 +627,7 @@ def get_versions_validator(version_list: list):
 
 
 class ConanRecipe:
-    def __init__(self, index: ConanCenterIndex, name: str):
+    def __init__(self, index, name):
         self.index = index
         self.name = name
         self.recipe_dir = os.path.join(index.recipes_dir, name)
@@ -650,7 +650,7 @@ class ConanRecipe:
             version = repr(version)
         return os.path.join(self.recipe_dir, self.conf["versions"][version]["folder"])
 
-    def export_to_zip(self, zt: ZipTool, version_list: list, tq=None):
+    def export_to_zip(self, zt, version_list, tq=None):
         zipped = set()
         validator = get_versions_validator(version_list)
         for version in self.versions(validator):
@@ -781,16 +781,16 @@ class ConanData:
 
 
 class ConanRecipeDownloader:
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir):
         self.cache_dir = cache_dir
 
-    def download_source(self, source: ConanResource):
+    def download_source(self, source):
         url, source_path = source.download(self.cache_dir)
         if url:
             source.set_url(url)
         return url, source_path
 
-    def download_versions(self, recipe: ConanRecipe, zt: ZipTool, versions: list, tq=None):
+    def download_versions(self, recipe, zt, versions, tq=None):
         if tq:
             tq.set_postfix({"name": recipe.name}, refresh=True)
         validator = get_versions_validator(versions)
@@ -853,7 +853,7 @@ class RequireTree:
 
 
 class RequireTreeNode:
-    def __init__(self, root: RequireTree, name):
+    def __init__(self, root, name):
         self.name = name
         data = root.tree.get(name)
         if not data:
@@ -890,7 +890,7 @@ class RequireTreeNode:
             self.requires.append(require)
             print(f"包 {self.name} 依赖 {require}")
 
-    def build_and_upload(self, remote, recipe: ConanRecipe, tq):
+    def build_and_upload(self, remote, recipe, tq):
         tq.set_description(f"正在构建 {self.name}")
         for version in self.versions:
             package_name = f"{self.name}/{version}"
@@ -940,7 +940,7 @@ class ConanRecipeWithRequiresDownloader:
                 visited.add(recipe_dir)
                 self.collect_all_requires(parent=name, requires=ConanData.get_requires(recipe_dir), visited=visited)
 
-    def download(self, requires: list):
+    def download(self, requires):
         print("开始加载依赖关系...")
         self.collect_all_requires(requires)
         self.zip_tool.writestr(REQUIRES_TREE_FILE, self.requires_tree.dumps())
