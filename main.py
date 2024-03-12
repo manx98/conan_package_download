@@ -497,8 +497,7 @@ class VersionRange:
         for t in tokens[1:]:
             if "include_prerelease" in t:
                 if "include_prerelease=" in t:
-                    from conan.api.output import ConanOutput
-                    ConanOutput().warning(
+                    print(
                         f'include_prerelease version range option in "{expression}" does not take an attribute, '
                         'its presence unconditionally enables prereleases')
                 prereleases = True
@@ -506,8 +505,7 @@ class VersionRange:
             else:
                 t = t.strip()
                 if len(t) > 0 and t[0].isalpha():
-                    from conan.api.output import ConanOutput
-                    ConanOutput().warning(f'Unrecognized version range option "{t}" in "{expression}"')
+                    print(f'Unrecognized version range option "{t}" in "{expression}"')
                 else:
                     raise Exception(f'"{t}" in version range "{expression}" is not a valid option')
         version_expr = tokens[0]
@@ -687,7 +685,7 @@ class ConanResource:
             source_path = get_dir_by_link(cache_dir, url)
             if os.path.exists(source_path):
                 local_sha256 = sha256_file(source_path)
-                if local_sha256 != self.sha256:
+                if local_sha256 != f"{self.sha256}".lower():
                     raise Exception("failed to check sum source file, except sha256 %s, but got %s: %s" %
                                     (self.sha256, local_sha256, source_path))
                 return url, source_path
@@ -697,7 +695,7 @@ class ConanResource:
             try:
                 with open(source_path_tmp, "wb") as file:
                     local_sha256 = download(file, url)
-                if local_sha256 != self.sha256:
+                if local_sha256 != f"{self.sha256}".lower():
                     raise Exception("failed to check sum download file, except sha256 %s, but got %s: %s" %
                                     (self.sha256, local_sha256, url))
                 try:
