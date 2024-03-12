@@ -461,7 +461,7 @@ class _ConditionSet:
         else:
             return [_Condition(operator, Version(version))]
 
-    def _valid(self, version, conf_resolve_prepreleases):
+    def valid(self, version, conf_resolve_prepreleases):
         if version.pre:
             # Follow the expression desires only if core.version_ranges:resolve_prereleases is None,
             # else force to the conf's value
@@ -528,7 +528,7 @@ class VersionRange:
         """
         assert isinstance(version, Version), type(version)
         for condition_set in self.condition_sets:
-            if condition_set._valid(version, resolve_prerelease):
+            if condition_set.valid(version, resolve_prerelease):
                 return True
         return False
 
@@ -1219,29 +1219,29 @@ def build_and_upload_recipes(params):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Conan中央仓库离线工具')
-    parser.set_defaults(func=lambda x: parser.print_help())
-    subparsers = parser.add_subparsers(help="子命令")
-    archive = subparsers.add_parser("archive", description="打包conan资源文件")
-    archive.add_argument("dest", help="保存到的路径")
-    archive.add_argument("requires", nargs='+', help="需要导出的依赖包")
-    archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
-    archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
-    archive.set_defaults(func=archive_all_to_file)
-    upload = subparsers.add_parser("upload")
-    upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
-    upload.add_argument("--f", type=bool, default=False, help="直接覆盖已存在的资源文件")
-    upload.set_defaults(func=upload_to_artifactory_server)
-    extract = subparsers.add_parser("extract", description="解压conan打包文件")
-    extract.add_argument("src", help="打包的资源文件")
-    extract.add_argument("dest", help="解压到的路径")
-    extract.set_defaults(func=extract_recipes)
-    build = subparsers.add_parser("build", description="执行conan构建并上传")
-    build.add_argument("recipes_dir", help="解压后的打包文件路径")
-    build.add_argument("--f", type=bool, default=False, help="强制重新构建")
-    build.add_argument("--export_only", type=bool, default=False, help="仅导出上传")
-    build.set_defaults(func=build_and_upload_recipes)
-    version = subparsers.add_parser("version", description="查看当前版本")
-    version.set_defaults(func=lambda params: print(VERSION))
-    args = parser.parse_args()
-    args.func(args)
+    _parser = argparse.ArgumentParser(description='Conan中央仓库离线工具')
+    _parser.set_defaults(func=lambda x: _parser.print_help())
+    _subparsers = _parser.add_subparsers(help="子命令")
+    _archive = _subparsers.add_parser("archive", description="打包conan资源文件")
+    _archive.add_argument("dest", help="保存到的路径")
+    _archive.add_argument("requires", nargs='+', help="需要导出的依赖包")
+    _archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
+    _archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
+    _archive.set_defaults(func=archive_all_to_file)
+    _upload = _subparsers.add_parser("upload")
+    _upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
+    _upload.add_argument("--f", type=bool, default=False, help="直接覆盖已存在的资源文件")
+    _upload.set_defaults(func=upload_to_artifactory_server)
+    _extract = _subparsers.add_parser("extract", description="解压conan打包文件")
+    _extract.add_argument("src", help="打包的资源文件")
+    _extract.add_argument("dest", help="解压到的路径")
+    _extract.set_defaults(func=extract_recipes)
+    _build = _subparsers.add_parser("build", description="执行conan构建并上传")
+    _build.add_argument("recipes_dir", help="解压后的打包文件路径")
+    _build.add_argument("--f", type=bool, default=False, help="强制重新构建")
+    _build.add_argument("--export_only", type=bool, default=False, help="仅导出上传")
+    _build.set_defaults(func=build_and_upload_recipes)
+    _version = _subparsers.add_parser("version", description="查看当前版本")
+    _version.set_defaults(func=lambda params: print(VERSION))
+    _args = _parser.parse_args()
+    _args.func(_args)
