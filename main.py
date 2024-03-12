@@ -729,13 +729,18 @@ class ConanResource:
 
 def find_and_add_link_item(result, data):
     if isinstance(data, dict):
-        for source in data.values():
-            if isinstance(source, dict):
-                keys = source.keys()
-                if len(keys) == 2 and 'url' in keys and 'sha256' in keys:
-                    result.append(ConanResource(source))
-                else:
-                    find_and_add_link_item(result, source)
+        keys = data.keys()
+        if len(keys) == 2 and 'url' in keys and 'sha256' in keys:
+            result.append(ConanResource(data))
+            return
+        else:
+            data = data.values()
+    elif isinstance(data, (list, tuple)):
+        pass
+    else:
+        return
+    for source in data:
+        find_and_add_link_item(result, source)
 
 
 class ConanData:
