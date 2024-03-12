@@ -893,7 +893,7 @@ class RequireTreeNode:
             self.requires.remove(require)
 
     def add_require(self, require):
-        if require not in self.requires:
+        if require != self.name and require not in self.requires:
             self.requires.append(require)
             print(f"包 {self.name} 依赖 {require}")
 
