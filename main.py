@@ -9,11 +9,12 @@ from urllib.parse import urlparse
 import os
 from zipfile import ZipFile, ZIP_DEFLATED
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from tqdm import tqdm
 import hashlib
 
 VERSION = "v0.0.1"
-THREAD_POOL = ThreadPoolExecutor(max_workers=3)
+THREAD_POOL = ThreadPoolExecutor(max_workers=cpu_count())
 CONAN_CENTER_INDEX_RECIPES_DIR = "conan-center-index-master/recipes/"
 CONAN_CENTER_RECIPES_DIR = "recipes"
 CONAN_CENTER_SOURCE_CACHE_DIR = "sources"
