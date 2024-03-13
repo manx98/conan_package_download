@@ -1192,6 +1192,16 @@ def download_conan_index(recipes_dir, index_url):
     os.rename(recipes_dir_tmp, recipes_dir)
 
 
+def load_requires_from_file(f):
+    with open(f, "r", encoding="utf8") as f:
+        result = []
+        for require in f.readlines():
+            require = require.strip()
+            if require:
+                result.append(require)
+        return result
+
+
 def archive_all_to_file(params):
     """
     下载并导出conan资源到文件
@@ -1202,9 +1212,14 @@ def archive_all_to_file(params):
     conan_recipes_dir = get_conan_recipes_dir()
     if not os.path.exists(conan_recipes_dir):
         raise Exception(f"索引路径 {conan_recipes_dir} 不存在，请先执行index操作更新索引")
+    requires = params.r
+    if not requires:
+        if not params.f:
+            raise Exception("请指定要下载的conan包，或者-f指定包列表文件")
+        requires = load_requires_from_file(params.f)
     with ConanRecipeWithRequiresDownloader(conan_recipes_dir, sources_cache_dir,
-                                           params.dest, compress_level=params.compress_level) as downloader:
-        downloader.download(params.requires)
+                                           params.o, compress_level=params.l) as downloader:
+        downloader.download(requires)
 
 
 def upload_to_artifactory_server(params):
@@ -1213,7 +1228,7 @@ def upload_to_artifactory_server(params):
      :param params:
      :return:
     """
-    tool = ArtifactoryTool(params.src, get_artifactory_upload_server_url())
+    tool = ArtifactoryTool(params.i, get_artifactory_upload_server_url())
     tool.upload_source_to_server(params.f)
 
 
@@ -1221,22 +1236,22 @@ def extract_recipes(params):
     """
     解压conan资源导出包
     """
-    if os.path.exists(params.dest):
-        shutil.rmtree(params.dest)
-    tool = ArtifactoryTool(params.src, get_artifactory_download_server_url())
-    tool.extract_recipes(params.dest)
+    if os.path.exists(params.o):
+        shutil.rmtree(params.o)
+    tool = ArtifactoryTool(params.i, get_artifactory_download_server_url())
+    tool.extract_recipes(params.o)
 
 
 def build_and_upload_recipes(params):
     """
     执行构建并上传到指定远程仓库
     """
-    tool = ConanBuildTool(get_conan_local_repository(), params.recipes_dir)
-    tool.create_and_upload(params.f, export_only=params.export_only)
+    tool = ConanBuildTool(get_conan_local_repository(), params.i)
+    tool.create_and_upload(params.f, export_only=params.e)
 
 
 if __name__ == '__main__':
-    _parser = argparse.ArgumentParser(description='Conan中央仓库离线工具')
+    _parser = argparse.ArgumentParser(description='Conan中央仓库包离线导出导入工具')
     _parser.set_defaults(func=lambda x: _parser.print_help())
     _subparsers = _parser.add_subparsers(help="子命令")
     _index = _subparsers.add_parser("index", description="更新conan索引缓存")
@@ -1244,24 +1259,24 @@ if __name__ == '__main__':
                         default="https://github.com/manx98/conan-center-index/archive/refs/heads/master.zip",
                         help="conan-center-index仓库下载地址")
     _index.set_defaults(func=lambda params: download_conan_index(get_conan_recipes_dir(), params.r))
-    _archive = _subparsers.add_parser("archive", description="打包conan资源文件")
-    _archive.add_argument("dest", help="保存到的路径")
-    _archive.add_argument("requires", nargs='+', help="需要导出的依赖包")
-    _archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
-    _archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
+    _archive = _subparsers.add_parser("arc", description="打包conan资源文件")
+    _archive.add_argument("-o", help="保存到的路径")
+    _archive.add_argument("-r", nargs='+', help="需要导出的包名")
+    _archive.add_argument("-f", type=str, help="需要导出的包清单文件(文件每行一个包名)")
+    _archive.add_argument("-l", type=int, default=9, help="压缩等级(0-9)")
     _archive.set_defaults(func=archive_all_to_file)
     _upload = _subparsers.add_parser("upload")
-    _upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
-    _upload.add_argument("--f", type=bool, default=False, help="直接覆盖已存在的资源文件")
+    _upload.add_argument("-i", required=True, help="上传的资源文件到Artifactory服务器")
+    _upload.add_argument("-f", type=bool, default=False, help="直接覆盖已存在的资源文件")
     _upload.set_defaults(func=upload_to_artifactory_server)
-    _extract = _subparsers.add_parser("extract", description="解压conan打包文件")
-    _extract.add_argument("src", help="打包的资源文件")
-    _extract.add_argument("dest", help="解压到的路径")
+    _extract = _subparsers.add_parser("ext", description="解压conan打包文件")
+    _extract.add_argument("-i", required=True, help="打包的资源文件")
+    _extract.add_argument("-o", required=True, help="解压到的路径")
     _extract.set_defaults(func=extract_recipes)
     _build = _subparsers.add_parser("build", description="执行conan构建并上传")
-    _build.add_argument("recipes_dir", help="解压后的打包文件路径")
-    _build.add_argument("--f", type=bool, default=False, help="强制重新构建")
-    _build.add_argument("--export_only", type=bool, default=False, help="仅导出上传")
+    _build.add_argument("-i", help="解压后的打包文件路径")
+    _build.add_argument("-f", type=bool, default=False, help="强制重新构建")
+    _build.add_argument("-e", type=bool, default=False, help="仅导出上传")
     _build.set_defaults(func=build_and_upload_recipes)
     _version = _subparsers.add_parser("version", description="查看当前版本")
     _version.set_defaults(func=lambda params: print(VERSION))
