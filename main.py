@@ -1125,10 +1125,8 @@ class ConanBuildTool:
                 self.tree.remove_node(node.name)
 
 
-def get_conan_recipes_dir(index_url, force=False):
-    conan_recipes_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_RECIPES_DIR)
-    download_conan_index(conan_recipes_dir, index_url, force=force)
-    return conan_recipes_dir
+def get_conan_recipes_dir():
+    return os.path.join(get_conan_cache_dir(), CONAN_CENTER_RECIPES_DIR)
 
 
 def get_conan_cache_dir():
@@ -1160,21 +1158,18 @@ def get_artifactory_download_server_url():
     return artifactory_download_server_url
 
 
-def download_conan_index(recipes_dir, index_url, force=False):
+def download_conan_index(recipes_dir, index_url):
     if os.path.exists(recipes_dir):
-        if force:
-            print("正在删除索引目录...")
-            shutil.rmtree(recipes_dir)
-        else:
-            return
+        print(f"正在删除索引目录: {recipes_dir}")
+        shutil.rmtree(recipes_dir)
     recipes_dir_tmp = recipes_dir + "_tmp"
     if os.path.exists(recipes_dir_tmp):
-        print("正在删除临时目录...")
+        print(f"正在删除临时目录: {recipes_dir_tmp}")
         shutil.rmtree(recipes_dir_tmp)
     os.makedirs(recipes_dir_tmp, exist_ok=True)
     tmp_file = os.path.join(recipes_dir_tmp, "master.zip")
     try:
-        print("开始下载索引文件...")
+        print(f"开始下载索引文件: {index_url}")
         with open(tmp_file, "wb") as f:
             download(f, index_url)
         with ZipFile(tmp_file) as zip_file:
@@ -1199,7 +1194,10 @@ def archive_all_to_file(params):
     :return:
     """
     sources_cache_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_SOURCE_CACHE_DIR)
-    with ConanRecipeWithRequiresDownloader(get_conan_recipes_dir(index_url=params.r, force=params.f), sources_cache_dir,
+    conan_recipes_dir = get_conan_recipes_dir()
+    if not os.path.exists(sources_cache_dir):
+        raise Exception("索引不存在，请先执行index命令更新索引")
+    with ConanRecipeWithRequiresDownloader(conan_recipes_dir, sources_cache_dir,
                                            params.dest, compress_level=params.compress_level) as downloader:
         downloader.download(params.requires)
 
@@ -1236,14 +1234,16 @@ if __name__ == '__main__':
     _parser = argparse.ArgumentParser(description='Conan中央仓库离线工具')
     _parser.set_defaults(func=lambda x: _parser.print_help())
     _subparsers = _parser.add_subparsers(help="子命令")
+    _index = _subparsers.add_parser("index", description="更新conan索引缓存")
+    _index.add_argument("--r", type=str,
+                        default="https://github.com/manx98/conan-center-index/archive/refs/heads/master.zip",
+                        help="conan-center-index仓库下载地址")
+    _index.set_defaults(func=lambda params: download_conan_index(get_conan_recipes_dir(), params.r))
     _archive = _subparsers.add_parser("archive", description="打包conan资源文件")
     _archive.add_argument("dest", help="保存到的路径")
     _archive.add_argument("requires", nargs='+', help="需要导出的依赖包")
     _archive.add_argument("--f", type=bool, default=False, help="强制更新本地索引缓存")
     _archive.add_argument("--compress_level", type=int, default=9, help="压缩等级(0-9)")
-    _archive.add_argument("--r", type=str,
-                          default="https://github.com/manx98/conan-center-index/archive/refs/heads/master.zip",
-                          help="conan-center-index仓库下载地址")
     _archive.set_defaults(func=archive_all_to_file)
     _upload = _subparsers.add_parser("upload")
     _upload.add_argument("src", help="上传的资源文件到Artifactory服务器")
