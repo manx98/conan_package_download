@@ -865,8 +865,8 @@ class RequireTree:
 class RequireTreeNode:
     def __init__(self, root, name):
         self.name = name
-        data = root.tree.get(name)
-        if not data:
+        self.data = root.tree.get(name)
+        if not self.data:
             self.ignore = False
             self.requires = []
             self.versions = []
@@ -876,9 +876,14 @@ class RequireTreeNode:
                 'versions': self.versions,
             }
         else:
-            self.ignore = data['ignore']
-            self.requires = data['requires']
-            self.versions = data['versions']
+            self.ignore = self.data['ignore']
+            self.requires = self.data['requires']
+            self.versions = self.data['versions']
+
+    def set_ignore(self, val):
+        if self.ignore != val:
+            self.data['ignore'] = val
+            self.ignore = val
 
     def add_version(self, version):
         if version not in self.versions:
@@ -1042,7 +1047,7 @@ class ArtifactoryTool:
                     with zip_file.open(name) as requires_tree_file:
                         requires_tree = RequireTree(yaml.safe_load(requires_tree_file))
                         for node in requires_tree.nodes():
-                            node.ignore = is_windows() and (node.name in WINDOWS_ONLY_PACKAGE)
+                            node.set_ignore(not is_windows() and (node.name in WINDOWS_ONLY_PACKAGE))
                         with open(os.path.join(output_dir, REQUIRES_TREE_FILE), "w", encoding="utf8") as f:
                             f.write(requires_tree.dumps())
                         return name
