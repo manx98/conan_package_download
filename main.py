@@ -1195,8 +1195,8 @@ def archive_all_to_file(params):
     """
     sources_cache_dir = os.path.join(get_conan_cache_dir(), CONAN_CENTER_SOURCE_CACHE_DIR)
     conan_recipes_dir = get_conan_recipes_dir()
-    if not os.path.exists(sources_cache_dir):
-        raise Exception("索引不存在，请先执行index命令更新索引")
+    if not os.path.exists(conan_recipes_dir):
+        raise Exception(f"索引路径 {conan_recipes_dir} 不存在，请先执行index操作更新索引")
     with ConanRecipeWithRequiresDownloader(conan_recipes_dir, sources_cache_dir,
                                            params.dest, compress_level=params.compress_level) as downloader:
         downloader.download(params.requires)
