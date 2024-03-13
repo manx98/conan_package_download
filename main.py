@@ -1,4 +1,5 @@
 import argparse
+import platform
 import shutil
 from functools import total_ordering
 
@@ -27,6 +28,8 @@ CACHE_TEMPORARY_SUFFIX = ".tmp"
 FIRST_BUILD_PACKAGE = ["msys2", "ninja", "m4",
                        "autoconf", "gnu-config", "automake",
                        "strawberryperl", "meson", "pkgconf", "libtool"]
+# windows 平台专用包名
+WINDOWS_ONLY_PACKAGE = ["msys2", "strawberryperl"]
 
 
 def sha256_file(file_path):
@@ -121,6 +124,10 @@ def collect_requires(collect, conan_file_py_path):
         if require is None:
             break
         collect(require)
+
+
+def is_windows():
+    return platform.system() == "Windows"
 
 
 class ZipTool:
@@ -1030,6 +1037,14 @@ class ArtifactoryTool:
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
                         with open(save_path, "w", encoding="utf8") as f:
                             f.write(conan_data.dump())
+                        return name
+                elif name == REQUIRES_TREE_FILE:
+                    with zip_file.open(name) as requires_tree_file:
+                        requires_tree = RequireTree(yaml.safe_load(requires_tree_file))
+                        for node in requires_tree.nodes():
+                            node.ignore = is_windows() and (node.name in WINDOWS_ONLY_PACKAGE)
+                        with open(os.path.join(output_dir, REQUIRES_TREE_FILE), "w", encoding="utf8") as f:
+                            f.write(requires_tree.dumps())
                         return name
                 else:
                     return extract_file(zip_file, name, output_dir)
