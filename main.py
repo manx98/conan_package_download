@@ -891,6 +891,12 @@ class RequireTreeNode:
             self.versions.append(repr(version))
             print(f"需要下载包: {self.name}/{version}")
 
+    def has_version(self, check_func):
+        for version in self.versions:
+            if check_func(Version(version)):
+                return True
+        return False
+
     def check_and_remove_exist_version(self, remote):
         for version in self.versions:
             if conan_exist_package(f"{self.name}/{version}", remote):
@@ -943,7 +949,7 @@ class ConanRecipeWithRequiresDownloader:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.zip_tool.__exit__(exc_type, exc_val, exc_tb)
 
-    def collect_all_requires(self, requires, parent=None, visited=None):
+    def collect_all_requires(self, requires, parent=None, visited=None, is_child=True):
         if visited is None:
             visited = set()
         if parent:
@@ -954,7 +960,10 @@ class ConanRecipeWithRequiresDownloader:
                 parent.add_require(name)
             child = self.requires_tree.get_node(name)
             recipe = self.index.get_recipe(name)
-            for version in recipe.versions(get_version_validator(version)):
+            validator_ = get_version_validator(version)
+            for version in recipe.versions(validator_):
+                if is_child and child.has_version(validator_):
+                    continue
                 child.add_version(version)
                 recipe_dir = recipe.get_recipe_dir(version)
                 if recipe_dir in visited:
@@ -964,7 +973,7 @@ class ConanRecipeWithRequiresDownloader:
 
     def download(self, requires):
         print("开始加载依赖关系...")
-        self.collect_all_requires(requires)
+        self.collect_all_requires(requires, is_child=False)
         self.zip_tool.writestr(REQUIRES_TREE_FILE, self.requires_tree.dumps())
         total = 0
         for node in self.requires_tree.nodes():
