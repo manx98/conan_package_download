@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 from tqdm import tqdm
 import hashlib
+import ast
 
 VERSION = "v0.0.1"
 THREAD_POOL = ThreadPoolExecutor(max_workers=cpu_count())
@@ -93,38 +94,17 @@ def conan_exist_package(package, remote):
     return os.popen(f"conan list \"{package}\" -r={remote}").read().find("not found") == -1
 
 
-def find_content(start, content, prefix):
-    start = content.find(prefix, start)
-    if start == -1:
-        return None, None
-    start += len(prefix)
-    end = content.find(")", start)
-    if end == -1:
-        return None, None
-    start = content.find("\"", start, end)
-    if start == -1:
-        return None, None
-    start += 1
-    end = content.find("\"", start, end)
-    if end == -1:
-        return None, None
-    return content[start:end], end
-
-
 def collect_requires(collect, conan_file_py_path):
     with open(conan_file_py_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    start = 0
-    while True:
-        tool_require, start = find_content(start, content, "self.tool_requires(")
-        if tool_require is None:
-            break
-        collect(tool_require)
-    while True:
-        require, start = find_content(start, content, "self.requires(")
-        if require is None:
-            break
-        collect(require)
+        node = ast.parse(f.read())
+    for node in ast.walk(node):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if (func.attr == "requires" or func.attr == "tool_requires") and func.value.id == "self" and node.args:
+                    arg = node.args[0]
+                    if isinstance(arg, ast.Constant):
+                        collect(arg.value)
 
 
 def is_windows():
