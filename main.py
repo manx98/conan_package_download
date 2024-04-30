@@ -792,7 +792,10 @@ class ConanRecipeDownloader:
             recipe_dir = recipe.get_recipe_dir(version)
             if conan_data.get(recipe_dir) is not None:
                 continue
-            conan_data[recipe_dir] = ConanData.load(recipe_dir)
+            try:
+                conan_data[recipe_dir] = ConanData.load(recipe_dir)
+            except FileNotFoundError as _:
+                pass
         validator = get_versions_validator(versions)
         download_tasks = []
         for data in conan_data.values():
