@@ -854,15 +854,18 @@ class RequireTreeNode:
             self.ignore = False
             self.requires = []
             self.versions = []
+            self.options = {}
             root.tree[name] = {
                 "ignore": self.ignore,
                 'requires': self.requires,
                 'versions': self.versions,
+                'options': self.options
             }
         else:
             self.ignore = self.data['ignore']
             self.requires = self.data['requires']
             self.versions = self.data['versions']
+            self.options = self.data.get('options')
 
     def set_ignore(self, val):
         if self.ignore != val:
@@ -871,7 +874,9 @@ class RequireTreeNode:
 
     def add_version(self, version):
         if version not in self.versions:
-            self.versions.append(repr(version))
+            version = str(version)
+            self.versions.append(version)
+            self.options[version] = []
             print(f"需要下载包: {self.name}/{version}")
 
     def has_version(self, check_func):
@@ -898,16 +903,26 @@ class RequireTreeNode:
             self.requires.append(require)
             print(f"包 {self.name} 依赖 {require}")
 
+    def get_options(self, version):
+        if self.options:
+            version = str(version)
+            ops = self.options.get(version)
+            if ops:
+                ops.insert(0, "")
+                return " -o ".join(ops)
+        return ""
+
     def build_and_upload(self, remote, recipe, tq, export_only=False):
         tq.set_description(f"正在构建 {self.name}")
         for version in self.versions:
             package_name = f"{self.name}/{version}"
             tq.set_postfix({"building": version})
             work_dir = recipe.get_recipe_dir(version)
+            ops = self.get_options(version)
             if export_only:
-                code = os.system(f"conan export \"{work_dir}\" --version={version} --name={self.name}")
+                code = os.system(f"conan export \"{work_dir}\" --version={version} --name={self.name} {ops}")
             else:
-                code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} --build=missing")
+                code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} {ops} --build=missing")
             if code != 0:
                 raise Exception(f"构建 {package_name} 失败了, 错误退出码 {code}: {work_dir}")
             else:
