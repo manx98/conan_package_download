@@ -31,7 +31,10 @@ FIRST_BUILD_PACKAGE = ["msys2", "ninja", "m4",
                        "autoconf", "gnu-config", "automake",
                        "strawberryperl", "meson", "pkgconf", "libtool"]
 # windows 平台专用包名
-WINDOWS_ONLY_PACKAGE = ["msys2", "strawberryperl"]
+WINDOWS_ONLY_PACKAGE = {"msys2", "strawberryperl"}
+# linux 平台专用包名
+LINUX_ONLY_PACKAGE = {"linux-headers-generic", "libmount", "libsystemd",
+                      "egl", "libalsa", "libcap", "libselinux"}
 
 
 def sha256_file(file_path):
@@ -97,11 +100,12 @@ def conan_exist_package(package, remote):
 def collect_requires(collect, conan_file_py_path):
     with open(conan_file_py_path, "r", encoding="utf-8") as f:
         node = ast.parse(f.read())
+    collect_func_name = {"requires", "tool_requires", "build_requires", "test_requires"}
     for node in ast.walk(node):
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                if (func.attr == "requires" or func.attr == "tool_requires") and func.value.id == "self" and node.args:
+                if func.attr in collect_func_name and func.value.id == "self" and node.args:
                     arg = node.args[0]
                     if isinstance(arg, ast.Constant):
                         collect(arg.value)
@@ -112,7 +116,7 @@ def is_windows():
 
 
 class ZipTool:
-    def __init__(self, path, compress_level=0):
+    def __init__(self, path, compress_level=3):
         self.zip_file = ZipFile(path, "w", ZIP_DEFLATED, compresslevel=compress_level)
 
     def __enter__(self):
@@ -922,7 +926,8 @@ class RequireTreeNode:
             if export_only:
                 code = os.system(f"conan export \"{work_dir}\" --version={version} --name={self.name} {ops}")
             else:
-                code = os.system(f"conan create \"{work_dir}\" --version={version} --name={self.name} {ops} --build=missing")
+                code = os.system(
+                    f"conan create \"{work_dir}\" --version={version} --name={self.name} {ops} --build=missing")
             if code != 0:
                 raise Exception(f"构建 {package_name} 失败了, 错误退出码 {code}: {work_dir}")
             else:
@@ -935,7 +940,7 @@ class RequireTreeNode:
 
 
 class ConanRecipeWithRequiresDownloader:
-    def __init__(self, recipes_dir, source_cache_dir, output_path, compress_level=0):
+    def __init__(self, recipes_dir, source_cache_dir, output_path, compress_level=3):
         self.index = ConanCenterIndex(recipes_dir)
         self.downloader = ConanRecipeDownloader(source_cache_dir)
         self.zip_tool = ZipTool(output_path, compress_level=compress_level)
@@ -1055,7 +1060,13 @@ class ArtifactoryTool:
                     with zip_file.open(name) as requires_tree_file:
                         requires_tree = RequireTree(yaml.safe_load(requires_tree_file))
                         for node in requires_tree.nodes():
-                            node.set_ignore(not is_windows() and (node.name in WINDOWS_ONLY_PACKAGE))
+                            node.set_ignore(
+                                (
+                                        (self.settings.os != "Windows" and (node.name in WINDOWS_ONLY_PACKAGE))
+                                        or
+                                        (self.settings.os != "Linux" and (node.name in LINUX_ONLY_PACKAGE))
+                                )
+                            )
                         with open(os.path.join(output_dir, REQUIRES_TREE_FILE), "w", encoding="utf8") as f:
                             f.write(requires_tree.dumps())
                         return name
@@ -1271,7 +1282,7 @@ if __name__ == '__main__':
     _archive.add_argument("-o", help="保存到的路径")
     _archive.add_argument("-r", nargs='+', help="需要导出的包名")
     _archive.add_argument("-f", type=str, help="需要导出的包清单文件(文件每行一个包名)")
-    _archive.add_argument("-l", type=int, default=9, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], help="压缩等级(0-9)")
+    _archive.add_argument("-l", type=int, default=3, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], help="压缩等级(0-9)")
     _archive.set_defaults(func=archive_all_to_file)
     _upload = _subparsers.add_parser("upload", help="上传资源文件到Artifactory服务器")
     _upload.add_argument("-i", required=True, help="需要上传的打包文件路径")
