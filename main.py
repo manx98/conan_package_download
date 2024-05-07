@@ -15,7 +15,6 @@ import hashlib
 import ast
 
 VERSION = "v0.0.1"
-THREAD_POOL = ThreadPoolExecutor(max_workers=cpu_count())
 CONAN_CENTER_INDEX_RECIPES_DIR = "conan-center-index-master/recipes/"
 CONAN_CENTER_RECIPES_DIR = "recipes"
 CONAN_CENTER_SOURCE_CACHE_DIR = "sources"
@@ -776,8 +775,9 @@ class ConanData:
 
 
 class ConanRecipeDownloader:
-    def __init__(self, cache_dir):
+    def __init__(self, max_workers, cache_dir):
         self.cache_dir = cache_dir
+        self.pool = ThreadPoolExecutor(max_workers=max_workers)
 
     def download_source(self, source):
         url, source_path = source.download(self.cache_dir)
@@ -805,7 +805,7 @@ class ConanRecipeDownloader:
         for data in conan_data.values():
             data.remove_source_by_validator(validator)
             for source in data.get_sources():
-                download_tasks.append(THREAD_POOL.submit(self.download_source, source))
+                download_tasks.append(self.pool.submit(self.download_source, source))
         for task in as_completed(download_tasks):
             url, source_path = task.result()
             if tq:
@@ -940,9 +940,9 @@ class RequireTreeNode:
 
 
 class ConanRecipeWithRequiresDownloader:
-    def __init__(self, recipes_dir, source_cache_dir, output_path, compress_level=3):
+    def __init__(self, recipes_dir, source_cache_dir, output_path, max_workers, compress_level=3):
         self.index = ConanCenterIndex(recipes_dir)
-        self.downloader = ConanRecipeDownloader(source_cache_dir)
+        self.downloader = ConanRecipeDownloader(max_workers, source_cache_dir)
         self.zip_tool = ZipTool(output_path, compress_level=compress_level)
         self.requires_tree = RequireTree()
 
@@ -1005,8 +1005,9 @@ def extract_file(zip_file, filename, output_dir, out_filename=None):
 
 
 class ArtifactoryTool:
-    def __init__(self, zip_file_path, server_url):
+    def __init__(self, zip_file_path, server_url, max_workers):
         self.zip_file_path = zip_file_path
+        self.pool = ThreadPoolExecutor(max_workers=max_workers)
         if not server_url.endswith("/"):
             self.server_url = server_url + "/"
         else:
@@ -1029,7 +1030,7 @@ class ArtifactoryTool:
             tasks = []
             for file in zip_file.filelist:
                 if file.filename.startswith(SOURCES_PREFIX):
-                    tasks.append(THREAD_POOL.submit(self.upload, zip_file, file.filename, force_upload))
+                    tasks.append(self.pool.submit(self.upload, zip_file, file.filename, force_upload))
             with tqdm(total=len(tasks), desc="上传source") as tq:
                 for task in as_completed(tasks):
                     file = task.result()
@@ -1039,6 +1040,10 @@ class ArtifactoryTool:
                     tq.update()
 
     def extract_recipes(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        current_os = platform.system()
+        not_linux = current_os != "Linux"
+        not_windows = current_os != "Windows"
         with ZipFile(self.zip_file_path) as zip_file:
             def _extract_file(name):
                 if name.endswith(CONAN_DATA_YML):
@@ -1062,9 +1067,9 @@ class ArtifactoryTool:
                         for node in requires_tree.nodes():
                             node.set_ignore(
                                 (
-                                        (self.settings.os != "Windows" and (node.name in WINDOWS_ONLY_PACKAGE))
+                                        (not_windows and (node.name in WINDOWS_ONLY_PACKAGE))
                                         or
-                                        (self.settings.os != "Linux" and (node.name in LINUX_ONLY_PACKAGE))
+                                        (not_linux and (node.name in LINUX_ONLY_PACKAGE))
                                 )
                             )
                         with open(os.path.join(output_dir, REQUIRES_TREE_FILE), "w", encoding="utf8") as f:
@@ -1076,10 +1081,10 @@ class ArtifactoryTool:
             tasks = []
             for file in zip_file.filelist:
                 if not file.filename.startswith(SOURCES_PREFIX) and not file.is_dir():
-                    tasks.append(THREAD_POOL.submit(_extract_file, file.filename))
+                    tasks.append(file.filename)
             with tqdm(total=len(tasks), desc="解包文件") as tq:
-                for task in as_completed(tasks):
-                    filename = task.result()
+                for task in tasks:
+                    filename = _extract_file(task)
                     tq.set_postfix({
                         "file": filename
                     })
@@ -1087,10 +1092,11 @@ class ArtifactoryTool:
 
 
 class ConanBuildTool:
-    def __init__(self, remote, recipes_dir):
+    def __init__(self, remote, recipes_dir, max_workers):
         self.remote = remote
         self.index = ConanCenterIndex(recipes_dir)
         self.tree = RequireTree.load(recipes_dir)
+        self.pool = ThreadPoolExecutor(max_workers=max_workers)
 
     def _check_and_remove_exist(self, node, version):
         return node, version, conan_exist_package(f"{node.name}/{version}", self.remote)
@@ -1106,7 +1112,7 @@ class ConanBuildTool:
             tasks = []
             for node in self.tree.nodes():
                 for version in node.versions:
-                    tasks.append(THREAD_POOL.submit(self._check_and_remove_exist, node, version))
+                    tasks.append(self.pool.submit(self._check_and_remove_exist, node, version))
             with tqdm(total=len(tasks), desc="检查已存在包") as tq:
                 for task in tasks:
                     node, version, exist = task.result()
@@ -1237,7 +1243,7 @@ def archive_all_to_file(params):
             raise Exception("请指定要下载的conan包，或者-f指定包列表文件")
         requires = load_requires_from_file(params.f)
     with ConanRecipeWithRequiresDownloader(conan_recipes_dir, sources_cache_dir,
-                                           params.o, compress_level=params.l) as downloader:
+                                           params.o, params.t, compress_level=params.l) as downloader:
         downloader.download(requires)
 
 
@@ -1247,7 +1253,7 @@ def upload_to_artifactory_server(params):
      :param params:
      :return:
     """
-    tool = ArtifactoryTool(params.i, get_artifactory_upload_server_url())
+    tool = ArtifactoryTool(params.i, get_artifactory_upload_server_url(), max_workers=params.t)
     tool.upload_source_to_server(params.f)
 
 
@@ -1257,7 +1263,7 @@ def extract_recipes(params):
     """
     if os.path.exists(params.o):
         shutil.rmtree(params.o)
-    tool = ArtifactoryTool(params.i, get_artifactory_download_server_url())
+    tool = ArtifactoryTool(params.i, get_artifactory_download_server_url(), params.t)
     tool.extract_recipes(params.o)
 
 
@@ -1265,7 +1271,7 @@ def build_and_upload_recipes(params):
     """
     执行构建并上传到指定远程仓库
     """
-    tool = ConanBuildTool(get_conan_local_repository(), params.i)
+    tool = ConanBuildTool(get_conan_local_repository(), params.i, params.t)
     tool.create_and_upload(params.f, export_only=params.e)
 
 
@@ -1283,19 +1289,23 @@ if __name__ == '__main__':
     _archive.add_argument("-r", nargs='+', help="需要导出的包名")
     _archive.add_argument("-f", type=str, help="需要导出的包清单文件(文件每行一个包名)")
     _archive.add_argument("-l", type=int, default=3, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], help="压缩等级(0-9)")
+    _archive.add_argument("-t", type=int, default=cpu_count(), help="最大线程数")
     _archive.set_defaults(func=archive_all_to_file)
     _upload = _subparsers.add_parser("upload", help="上传资源文件到Artifactory服务器")
     _upload.add_argument("-i", required=True, help="需要上传的打包文件路径")
     _upload.add_argument("-f", action='store_true', help="直接覆盖已存在的资源文件")
+    _upload.add_argument("-t", type=int, default=cpu_count(), help="最大线程数")
     _upload.set_defaults(func=upload_to_artifactory_server)
     _extract = _subparsers.add_parser("ext", description="解压conan打包文件")
     _extract.add_argument("-i", required=True, help="打包的资源文件")
     _extract.add_argument("-o", required=True, help="解压到的路径")
+    _extract.add_argument("-t", type=int, default=cpu_count(), help="最大线程数")
     _extract.set_defaults(func=extract_recipes)
     _build = _subparsers.add_parser("build", description="执行conan构建并上传")
     _build.add_argument("-i", help="解压后的打包文件路径")
     _build.add_argument("-f", action="store_true", help="强制重新构建")
     _build.add_argument("-e", action="store_true", help="仅导出上传")
+    _build.add_argument("-t", type=int, default=cpu_count(), help="最大线程数")
     _build.set_defaults(func=build_and_upload_recipes)
     _version = _subparsers.add_parser("version", description="查看当前版本")
     _version.set_defaults(func=lambda params: print(VERSION))
