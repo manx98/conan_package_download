@@ -858,18 +858,18 @@ class RequireTreeNode:
             self.ignore = False
             self.requires = []
             self.versions = []
-            self.options = {}
+            self.args = {}
             root.tree[name] = {
                 "ignore": self.ignore,
                 'requires': self.requires,
                 'versions': self.versions,
-                'options': self.options
+                'args': self.args
             }
         else:
             self.ignore = self.data['ignore']
             self.requires = self.data['requires']
             self.versions = self.data['versions']
-            self.options = self.data.get('options')
+            self.args = self.data.get('args')
 
     def set_ignore(self, val):
         if self.ignore != val:
@@ -880,7 +880,7 @@ class RequireTreeNode:
         if version not in self.versions:
             version = str(version)
             self.versions.append(version)
-            self.options[version] = []
+            self.args[version] = ""
             print(f"需要下载包: {self.name}/{version}")
 
     def has_version(self, check_func):
@@ -907,13 +907,12 @@ class RequireTreeNode:
             self.requires.append(require)
             print(f"包 {self.name} 依赖 {require}")
 
-    def get_options(self, version):
-        if self.options:
+    def get_args(self, version):
+        if self.args:
             version = str(version)
-            ops = self.options.get(version)
+            ops = self.args.get(version)
             if ops:
-                ops.insert(0, "")
-                return " -o ".join(ops)
+                return ops
         return ""
 
     def build_and_upload(self, remote, recipe, tq, export_only=False):
@@ -922,7 +921,7 @@ class RequireTreeNode:
             package_name = f"{self.name}/{version}"
             tq.set_postfix({"building": version})
             work_dir = recipe.get_recipe_dir(version)
-            ops = self.get_options(version)
+            ops = self.get_args(version)
             if export_only:
                 code = os.system(f"conan export \"{work_dir}\" --version={version} --name={self.name} {ops}")
             else:
